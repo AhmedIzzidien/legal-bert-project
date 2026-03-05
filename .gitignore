@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pyc
+checkpoints/
+best_model/
+*.safetensors
+*.pt
+*.bin
+.DS_Store
+Thumbs.db
