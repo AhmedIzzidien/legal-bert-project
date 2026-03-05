@@ -1,4 +1,4 @@
-# LegalBERT Judicial Review Classification
+# LegalBERT Summary Judgement Classification
 
 Replication code for analyzing domain-modulated outcome bias in LegalBERT classification of UK judicial review cases.
 
