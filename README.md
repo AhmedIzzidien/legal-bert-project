@@ -19,7 +19,7 @@ Replication code for analyzing domain-modulated outcome bias in LegalBERT classi
 ## Data
 
 - `sj_231025.pkl` - Main dataset (N=2,109 cases)
-- `sj_231025_w_topics_all_cases.pkl` - Dataset with LDA topic assignments
+- `sj_231025_w_topics_all_cases.pkl` - Dataset with topic assignments
 
 ## Requirements
 
