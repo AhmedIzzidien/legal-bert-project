@@ -1,870 +1,689 @@
 #!/usr/bin/env python3
 """
-Comprehensive Multi-Seed CV Results Extraction (FIXED)
+===============================================================================
+FIXED ATTENTION EXTRACTION (v2)
+===============================================================================
 
-Fixes applied:
-- Renamed 'label' to 'y_true' before merge to avoid ambiguity
-- Aggregated confusion matrix clearly labeled as descriptive
-- Per-fold iteration uses groupby for robustness
-- FP/FN renamed to directional labels
-- Added sanity checks and validation
-- Added majority vote evaluation (one prediction per case)
+Properly extracts attention using CORRECT methodology:
+
+FIXES APPLIED:
+1. Uses the CORRECT MODEL per case (matching seed/fold from all_predictions.csv)
+2. Reports RAW DENSITY (not normalized to sum=1)
+3. Reports BOTH mean and max across heads
+4. Uses MULTIPLE [MASK] tokens for ablation
+5. Verifies label mapping from model.config
+6. Special tokens already added during training (verified)
+
+Usage:
+    python fix_attention_v2.py
 """
 
-import pandas as pd
-import numpy as np
-from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score, confusion_matrix
 import os
+import json
+import warnings
+from datetime import datetime
+from pathlib import Path
+import re
 
-# =============================================================================
-# LOAD AND VALIDATE DATA
-# =============================================================================
+import numpy as np
+import pandas as pd
+import torch
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from tqdm import tqdm
 
-print("="*80)
-print("LOADING AND VALIDATING DATA")
-print("="*80)
+warnings.filterwarnings('ignore')
 
-# Check files exist
-assert os.path.exists('sj_231025.pkl'), "Missing: sj_231025.pkl"
-assert os.path.exists('legalbert_multiseed_attention/all_predictions.csv'), "Missing: all_predictions.csv"
-assert os.path.exists('legalbert_multiseed_attention/case_consistency.csv'), "Missing: case_consistency.csv"
+# ===============================================================================
+# CONFIGURATION
+# ===============================================================================
 
-# Load data
-df = pd.read_pickle('sj_231025.pkl')
-df = df[df['outcome'].isin(['summary judgment granted', 'summary judgment refused'])].copy()
-df['case_id'] = range(len(df))
-df['y_true'] = (df['outcome'] == 'summary judgment refused').astype(int)  # 0=granted, 1=refused
+DATA_DIR = Path("legalbert_multiseed_attention")
+ORIGINAL_DATA = "sj_231025.pkl"
+OUTPUT_DIR = Path("attention_fixed_v2")
+MAX_LENGTH = 512
+MASK_LENGTH = 50  # Number of [MASK] tokens to use
 
-all_preds = pd.read_csv('legalbert_multiseed_attention/all_predictions.csv')
-consistency = pd.read_csv('legalbert_multiseed_attention/case_consistency.csv')
+# ===============================================================================
+# GPU CHECK
+# ===============================================================================
 
-# Sanity checks
-print(f"\nDataset: {len(df)} cases")
-print(f"  Granted: {(df['y_true']==0).sum()} ({(df['y_true']==0).mean()*100:.1f}%)")
-print(f"  Refused: {(df['y_true']==1).sum()} ({(df['y_true']==1).mean()*100:.1f}%)")
+def check_gpu():
+    if not torch.cuda.is_available():
+        print("❌ No GPU available. This will be slow.")
+        return torch.device('cpu')
+    print(f"✅ Using GPU: {torch.cuda.get_device_name(0)}")
+    return torch.device('cuda')
 
-print(f"\nPredictions: {len(all_preds)} rows")
-print(f"  Seeds: {sorted(all_preds['seed'].unique())}")
-print(f"  Folds per seed: {all_preds.groupby('seed')['fold'].nunique().unique()}")
+# ===============================================================================
+# TEXT FORMATTING
+# ===============================================================================
 
-# Verify structure: each case appears once per seed
-cases_per_seed = all_preds.groupby('seed')['case_id'].nunique()
-print(f"  Cases per seed: {cases_per_seed.unique()}")
-assert (cases_per_seed == len(df)).all(), "Mismatch: not all cases predicted per seed"
+def format_text(row):
+    facts = str(row.get('facts', '') or '').strip()
+    applicant = str(row.get('applicant_reason', '') or '').strip()
+    defence = str(row.get('defence_reason', '') or '').strip()
+    return f"[FACTS] {facts} [APPLICANT] {applicant} [DEFENCE] {defence}"
 
-expected_rows = len(df) * len(all_preds['seed'].unique())
-assert len(all_preds) == expected_rows, f"Expected {expected_rows} rows, got {len(all_preds)}"
-print(f"  OK Validated: {len(df)} cases x {len(all_preds['seed'].unique())} seeds = {expected_rows} predictions")
 
-# Merge with RENAMED columns to avoid ambiguity
-# Check what columns are available for stratum analysis
-stratum_cols_available = all(['law' in df.columns, 'evidence' in df.columns, 'trial' in df.columns])
-
-if not stratum_cols_available:
-    print("  INFO: 'law', 'evidence', 'trial' columns not found directly")
-    print("  Extracting from 'decision_reason_categories_clean'...")
+def mask_section(text, section, mask_token="[MASK]", n_masks=MASK_LENGTH):
+    """Replace a section's content with multiple [MASK] tokens."""
+    mask_str = " ".join([mask_token] * n_masks)
     
-    # Format is: "LAW=1 EVIDENCE=1 TRIAL=0"
-    if 'decision_reason_categories_clean' in df.columns:
-        df['law'] = df['decision_reason_categories_clean'].str.extract(r'LAW=(\d)')[0].astype(int)
-        df['evidence'] = df['decision_reason_categories_clean'].str.extract(r'EVIDENCE=(\d)')[0].astype(int)
-        df['trial'] = df['decision_reason_categories_clean'].str.extract(r'TRIAL=(\d)')[0].astype(int)
-        print(f"  OK Extracted L/E/T from decision_reason_categories_clean")
-        print(f"     LAW=1: {df['law'].sum()} cases")
-        print(f"     EVIDENCE=1: {df['evidence'].sum()} cases")
-        print(f"     TRIAL=1: {df['trial'].sum()} cases")
-    else:
-        print("  WARNING: No decision_reason_categories_clean column found")
-        print("  Creating dummy L/E/T columns (all zeros)")
-        df['law'] = 0
-        df['evidence'] = 0
-        df['trial'] = 0
+    if section == 'FACTS':
+        return re.sub(r'\[FACTS\].*?\[APPLICANT\]', f'[FACTS] {mask_str} [APPLICANT]', text, flags=re.DOTALL)
+    elif section == 'APPLICANT':
+        return re.sub(r'\[APPLICANT\].*?\[DEFENCE\]', f'[APPLICANT] {mask_str} [DEFENCE]', text, flags=re.DOTALL)
+    elif section == 'DEFENCE':
+        return re.sub(r'\[DEFENCE\].*$', f'[DEFENCE] {mask_str}', text, flags=re.DOTALL)
+    return text
 
-df_info = df[['case_id', 'y_true', 'law', 'evidence', 'trial']].copy()
-n_before = len(all_preds)
-all_preds = all_preds.merge(df_info, on='case_id', how='left')
-assert len(all_preds) == n_before, f"Merge changed row count! {n_before} --> {len(all_preds)}"
+# ===============================================================================
+# ATTENTION EXTRACTION (FIXED)
+# ===============================================================================
 
-# Check no missing merges
-assert all_preds['y_true'].notna().all(), "Merge failed: missing y_true values"
-print(f"  OK Merge successful: {len(all_preds)} rows preserved, no missing values")
-
-# CRITICAL: Verify label consistency between all_predictions.csv and original data
-# The CSV has 'label', we computed 'y_true' from df - they MUST match
-if 'label' in all_preds.columns:
-    label_match = (all_preds['label'] == all_preds['y_true']).all()
-    if label_match:
-        print(f"  OK Label consistency verified: CSV 'label' == computed 'y_true'")
-    else:
-        mismatch = (all_preds['label'] != all_preds['y_true']).sum()
-        print(f"  WARNING WARNING: {mismatch} rows have label != y_true!")
-        print(f"     This indicates data inconsistency - investigate before proceeding!")
-        # Show examples
-        bad = all_preds[all_preds['label'] != all_preds['y_true']].head()
-        print(f"     Examples: {bad[['case_id', 'label', 'y_true']].to_dict('records')[:3]}")
-
-# =============================================================================
-# 1. OVERALL METRICS (per seed, then aggregated)
-# =============================================================================
-
-print("\n" + "="*80)
-print("1. OVERALL PERFORMANCE METRICS")
-print("="*80)
-
-seed_metrics = []
-
-for seed in sorted(all_preds['seed'].unique()):
-    seed_preds = all_preds[all_preds['seed'] == seed]
+def extract_attention(model, tokenizer, text, device):
+    """
+    Extract CLS attention from last layer.
+    Returns BOTH mean and max across heads.
+    """
+    model.eval()
     
-    y_true = seed_preds['y_true']
-    y_pred = seed_preds['predicted']
+    encoding = tokenizer(text, truncation=True, max_length=MAX_LENGTH,
+                         padding='max_length', return_tensors='pt')
     
-    acc = accuracy_score(y_true, y_pred)
-    f1_macro = f1_score(y_true, y_pred, average='macro')
-    f1_granted = f1_score(y_true, y_pred, pos_label=0)
-    f1_refused = f1_score(y_true, y_pred, pos_label=1)
-    prec_macro = precision_score(y_true, y_pred, average='macro')
-    prec_granted = precision_score(y_true, y_pred, pos_label=0)
-    prec_refused = precision_score(y_true, y_pred, pos_label=1)
-    rec_macro = recall_score(y_true, y_pred, average='macro')
-    rec_granted = recall_score(y_true, y_pred, pos_label=0)
-    rec_refused = recall_score(y_true, y_pred, pos_label=1)
+    input_ids = encoding['input_ids'].to(device)
+    attention_mask = encoding['attention_mask'].to(device)
     
-    seed_metrics.append({
-        'seed': seed,
-        'accuracy': acc,
-        'f1_macro': f1_macro,
-        'f1_granted': f1_granted,
-        'f1_refused': f1_refused,
-        'precision_macro': prec_macro,
-        'precision_granted': prec_granted,
-        'precision_refused': prec_refused,
-        'recall_macro': rec_macro,
-        'recall_granted': rec_granted,
-        'recall_refused': rec_refused,
-    })
-
-seed_df = pd.DataFrame(seed_metrics)
-
-print("\n1.1 Per-Seed Performance")
-print("-"*100)
-print(f"{'Seed':<8} {'Acc':<8} {'F1-Mac':<8} {'F1-Gr':<8} {'F1-Ref':<8} {'Prec-Gr':<9} {'Prec-Ref':<9} {'Rec-Gr':<8} {'Rec-Ref':<8}")
-print("-"*100)
-for _, row in seed_df.iterrows():
-    print(f"{int(row['seed']):<8} {row['accuracy']:.3f}    {row['f1_macro']:.3f}    {row['f1_granted']:.3f}    {row['f1_refused']:.3f}    {row['precision_granted']:.3f}     {row['precision_refused']:.3f}     {row['recall_granted']:.3f}    {row['recall_refused']:.3f}")
-
-print("\n1.2 Aggregated Performance (Mean +/- Std across 5 seeds)")
-print("-"*70)
-metrics_to_report = [
-    ('Accuracy', 'accuracy'),
-    ('F1-Macro', 'f1_macro'),
-    ('F1-Granted', 'f1_granted'),
-    ('F1-Refused', 'f1_refused'),
-    ('Precision-Macro', 'precision_macro'),
-    ('Precision-Granted', 'precision_granted'),
-    ('Precision-Refused', 'precision_refused'),
-    ('Recall-Macro', 'recall_macro'),
-    ('Recall-Granted', 'recall_granted'),
-    ('Recall-Refused', 'recall_refused'),
-]
-
-print(f"{'Metric':<20} {'Mean':<10} {'Std':<10} {'Min':<10} {'Max':<10}")
-print("-"*60)
-for name, col in metrics_to_report:
-    mean = seed_df[col].mean()
-    std = seed_df[col].std()
-    min_val = seed_df[col].min()
-    max_val = seed_df[col].max()
-    print(f"{name:<20} {mean:.4f}     {std:.4f}     {min_val:.4f}     {max_val:.4f}")
-
-# =============================================================================
-# 2. PER-FOLD METRICS (using groupby for robustness)
-# =============================================================================
-
-print("\n" + "="*80)
-print("2. PER-FOLD PERFORMANCE (all 25 folds)")
-print("="*80)
-
-fold_metrics = []
-
-for (seed, fold), fold_preds in all_preds.groupby(['seed', 'fold']):
-    y_true = fold_preds['y_true']
-    y_pred = fold_preds['predicted']
+    with torch.no_grad():
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, output_attentions=True)
     
-    acc = accuracy_score(y_true, y_pred)
-    f1_macro = f1_score(y_true, y_pred, average='macro')
-    f1_granted = f1_score(y_true, y_pred, pos_label=0)
-    f1_refused = f1_score(y_true, y_pred, pos_label=1)
+    # Safety check: ensure attentions were returned
+    if outputs.attentions is None or len(outputs.attentions) == 0:
+        raise RuntimeError(
+            "No attentions returned. Ensure model loaded with attn_implementation='eager'."
+        )
     
-    fold_metrics.append({
-        'seed': seed,
-        'fold': fold,
-        'n_cases': len(fold_preds),
-        'accuracy': acc,
-        'f1_macro': f1_macro,
-        'f1_granted': f1_granted,
-        'f1_refused': f1_refused,
-    })
-
-fold_df = pd.DataFrame(fold_metrics)
-
-print(f"\n{'Seed':<8} {'Fold':<6} {'N':<6} {'Acc':<8} {'F1-Mac':<8} {'F1-Gr':<8} {'F1-Ref':<8}")
-print("-"*60)
-for _, row in fold_df.iterrows():
-    print(f"{int(row['seed']):<8} {int(row['fold']):<6} {int(row['n_cases']):<6} {row['accuracy']:.3f}    {row['f1_macro']:.3f}    {row['f1_granted']:.3f}    {row['f1_refused']:.3f}")
-
-print(f"\nFold Aggregates (n=25 folds):")
-print(f"  Accuracy: {fold_df['accuracy'].mean():.4f} +/- {fold_df['accuracy'].std():.4f}")
-print(f"  F1-Macro: {fold_df['f1_macro'].mean():.4f} +/- {fold_df['f1_macro'].std():.4f}")
-
-# =============================================================================
-# 3. CONFUSION MATRICES (per seed - the valid evaluation)
-# =============================================================================
-
-print("\n" + "="*80)
-print("3. CONFUSION MATRICES (per seed)")
-print("="*80)
-
-print("\nNote: Each seed's confusion matrix represents independent evaluation.")
-print("      Summing across seeds would double-count cases.\n")
-
-seed_cms = []
-for seed in sorted(all_preds['seed'].unique()):
-    seed_preds = all_preds[all_preds['seed'] == seed]
-    y_true = seed_preds['y_true']
-    y_pred = seed_preds['predicted']
-    cm = confusion_matrix(y_true, y_pred)
-    seed_cms.append(cm)
+    # Last layer: (batch, heads, seq_len, seq_len)
+    attention = outputs.attentions[-1]
     
-    # Directional error rates
-    rate_refused_as_granted = cm[1, 0] / cm[1, :].sum()  # True refused, pred granted
-    rate_granted_as_refused = cm[0, 1] / cm[0, :].sum()  # True granted, pred refused
+    # CLS attention (row 0) per head: (heads, seq_len)
+    cls_attn_per_head = attention[0, :, 0, :].cpu().numpy()
     
-    print(f"Seed {seed}:")
-    print(f"                 Pred Granted    Pred Refused")
-    print(f"  True Granted   {cm[0,0]:>8}        {cm[0,1]:>8}")
-    print(f"  True Refused   {cm[1,0]:>8}        {cm[1,1]:>8}")
-    print(f"  Refused-->Granted: {rate_refused_as_granted:.1%}  |  Granted-->Refused: {rate_granted_as_refused:.1%}\n")
-
-# Mean confusion matrix across seeds
-mean_cm = np.mean(seed_cms, axis=0)
-std_cm = np.std(seed_cms, axis=0)
-
-print("Mean Confusion Matrix (+/- std across seeds):")
-print(f"                 Pred Granted         Pred Refused")
-print(f"  True Granted   {mean_cm[0,0]:.1f} +/- {std_cm[0,0]:.1f}      {mean_cm[0,1]:.1f} +/- {std_cm[0,1]:.1f}")
-print(f"  True Refused   {mean_cm[1,0]:.1f} +/- {std_cm[1,0]:.1f}      {mean_cm[1,1]:.1f} +/- {std_cm[1,1]:.1f}")
-
-# Mean error rates
-mean_refused_as_granted = np.mean([cm[1,0]/cm[1,:].sum() for cm in seed_cms])
-mean_granted_as_refused = np.mean([cm[0,1]/cm[0,:].sum() for cm in seed_cms])
-std_refused_as_granted = np.std([cm[1,0]/cm[1,:].sum() for cm in seed_cms])
-std_granted_as_refused = np.std([cm[0,1]/cm[0,:].sum() for cm in seed_cms])
-
-print(f"\nMean Error Rates:")
-print(f"  Refused-->Granted: {mean_refused_as_granted:.1%} +/- {std_refused_as_granted:.1%}")
-print(f"  Granted-->Refused: {mean_granted_as_refused:.1%} +/- {std_granted_as_refused:.1%}")
-
-# =============================================================================
-# 4. MAJORITY VOTE EVALUATION (one prediction per case)
-# =============================================================================
-
-print("\n" + "="*80)
-print("4. MAJORITY VOTE EVALUATION (ensemble across seeds)")
-print("="*80)
-
-# For each case, take majority vote across 5 seeds (deterministic: mean >= 0.5)
-case_votes = all_preds.groupby('case_id').agg({
-    'predicted': lambda x: int(x.mean() >= 0.5),  # Deterministic majority vote
-    'y_true': 'first',  # Same for all rows of same case
-}).reset_index()
-
-y_true_vote = case_votes['y_true']
-y_pred_vote = case_votes['predicted']
-
-acc_vote = accuracy_score(y_true_vote, y_pred_vote)
-f1_macro_vote = f1_score(y_true_vote, y_pred_vote, average='macro')
-f1_granted_vote = f1_score(y_true_vote, y_pred_vote, pos_label=0)
-f1_refused_vote = f1_score(y_true_vote, y_pred_vote, pos_label=1)
-prec_granted_vote = precision_score(y_true_vote, y_pred_vote, pos_label=0)
-prec_refused_vote = precision_score(y_true_vote, y_pred_vote, pos_label=1)
-rec_granted_vote = recall_score(y_true_vote, y_pred_vote, pos_label=0)
-rec_refused_vote = recall_score(y_true_vote, y_pred_vote, pos_label=1)
-cm_vote = confusion_matrix(y_true_vote, y_pred_vote)
-
-print(f"\nMajority Vote Performance (n={len(case_votes)} cases):")
-print(f"  Accuracy:          {acc_vote:.4f}")
-print(f"  F1-Macro:          {f1_macro_vote:.4f}")
-print(f"  F1-Granted:        {f1_granted_vote:.4f}")
-print(f"  F1-Refused:        {f1_refused_vote:.4f}")
-print(f"  Precision-Granted: {prec_granted_vote:.4f}")
-print(f"  Precision-Refused: {prec_refused_vote:.4f}")
-print(f"  Recall-Granted:    {rec_granted_vote:.4f}")
-print(f"  Recall-Refused:    {rec_refused_vote:.4f}")
-
-print(f"\nMajority Vote Confusion Matrix:")
-print(f"                 Pred Granted    Pred Refused")
-print(f"  True Granted   {cm_vote[0,0]:>8}        {cm_vote[0,1]:>8}")
-print(f"  True Refused   {cm_vote[1,0]:>8}        {cm_vote[1,1]:>8}")
-
-rate_refused_as_granted = cm_vote[1, 0] / cm_vote[1, :].sum()
-rate_granted_as_refused = cm_vote[0, 1] / cm_vote[0, :].sum()
-print(f"\n  Refused-->Granted: {rate_refused_as_granted:.1%}")
-print(f"  Granted-->Refused: {rate_granted_as_refused:.1%}")
-
-# =============================================================================
-# 5. CONSISTENCY ANALYSIS
-# =============================================================================
-
-print("\n" + "="*80)
-print("5. CONSISTENCY ANALYSIS")
-print("="*80)
-
-df_with_consistency = df.merge(consistency[['case_id', 'times_correct']], on='case_id', how='left')
-
-# CRITICAL: Check no cases were lost
-assert len(df_with_consistency) == len(df), f"Merge lost cases! {len(df)} --> {len(df_with_consistency)}"
-missing_consistency = df_with_consistency['times_correct'].isna().sum()
-if missing_consistency > 0:
-    print(f"  WARNING FATAL: {missing_consistency} cases missing from case_consistency.csv!")
-    missing_ids = df_with_consistency[df_with_consistency['times_correct'].isna()]['case_id'].tolist()
-    print(f"     Missing case_ids: {missing_ids[:10]}{'...' if len(missing_ids) > 10 else ''}")
-    raise ValueError("case_consistency.csv is incomplete - cannot proceed")
-print(f"  OK All {len(df)} cases have consistency data")
-
-print("\n5.1 Consistency Distribution")
-print("-"*60)
-print(f"{'Correct':<10} {'Cases':<10} {'Pct':<10} {'Interpretation':<30}")
-print("-"*60)
-for tc in range(6):
-    n = len(df_with_consistency[df_with_consistency['times_correct'] == tc])
-    pct = n / len(df_with_consistency) * 100
-    if tc == 0:
-        interp = "Always Wrong"
-    elif tc == 5:
-        interp = "Always Right"
-    else:
-        interp = f"Inconsistent ({tc}/5)"
-    print(f"{tc}/5       {n:<10} {pct:.1f}%      {interp:<30}")
-
-# By outcome
-print("\n5.2 Consistency by Outcome")
-print("-"*60)
-
-for outcome, label_val in [('Granted', 0), ('Refused', 1)]:
-    subset = df_with_consistency[df_with_consistency['y_true'] == label_val]
-    print(f"\n{outcome} (n={len(subset)}):")
-    print(f"  {'Correct':<10} {'Cases':<10} {'Pct':<10}")
-    for tc in range(6):
-        n = len(subset[subset['times_correct'] == tc])
-        pct = n / len(subset) * 100
-        print(f"  {tc}/5       {n:<10} {pct:.1f}%")
+    # Mean AND max across heads
+    cls_attn_mean = cls_attn_per_head.mean(axis=0)
+    cls_attn_max = cls_attn_per_head.max(axis=0)
     
-    always_wrong = len(subset[subset['times_correct'] == 0])
-    always_right = len(subset[subset['times_correct'] == 5])
-    print(f"  Always-Wrong Rate: {always_wrong/len(subset)*100:.1f}%")
-    print(f"  Always-Right Rate: {always_right/len(subset)*100:.1f}%")
-
-# =============================================================================
-# 6. STRATUM ANALYSIS
-# =============================================================================
-
-print("\n" + "="*80)
-print("6. PERFORMANCE BY STRATUM (LAW/EVIDENCE/TRIAL)")
-print("="*80)
-
-# Create stratum labels
-def get_stratum(row):
-    parts = []
-    if row['law'] == 1:
-        parts.append('LAW')
-    if row['evidence'] == 1:
-        parts.append('EVIDENCE')
-    if row['trial'] == 1:
-        parts.append('TRIAL')
-    if len(parts) == 0:
-        return 'NONE'
-    return ' + '.join(parts)
-
-df_with_consistency['stratum'] = df_with_consistency.apply(get_stratum, axis=1)
-all_preds['stratum'] = all_preds.apply(get_stratum, axis=1)
-
-print("\n6.1 Per-Stratum Performance (mean across seeds)")
-print("-"*100)
-
-stratum_metrics = []
-for stratum in sorted(df_with_consistency['stratum'].unique()):
-    stratum_cases = df_with_consistency[df_with_consistency['stratum'] == stratum]
+    tokens = tokenizer.convert_ids_to_tokens(input_ids.squeeze(0).cpu().numpy())
+    seq_len = attention_mask.sum().item()
     
-    # Compute per-seed metrics, then average
-    seed_accs = []
-    seed_f1s = []
-    for seed in all_preds['seed'].unique():
-        stratum_seed_preds = all_preds[(all_preds['stratum'] == stratum) & (all_preds['seed'] == seed)]
-        if len(stratum_seed_preds) > 0:
-            y_true = stratum_seed_preds['y_true']
-            y_pred = stratum_seed_preds['predicted']
-            seed_accs.append(accuracy_score(y_true, y_pred))
-            seed_f1s.append(f1_score(y_true, y_pred, average='macro', zero_division=0))
-    
-    always_wrong = len(stratum_cases[stratum_cases['times_correct'] == 0])
-    always_right = len(stratum_cases[stratum_cases['times_correct'] == 5])
-    
-    stratum_metrics.append({
-        'stratum': stratum,
-        'n_cases': len(stratum_cases),
-        'accuracy_mean': np.mean(seed_accs),
-        'accuracy_std': np.std(seed_accs),
-        'f1_macro_mean': np.mean(seed_f1s),
-        'f1_macro_std': np.std(seed_f1s),
-        'always_wrong': always_wrong,
-        'always_wrong_pct': always_wrong / len(stratum_cases) * 100,
-        'always_right': always_right,
-        'always_right_pct': always_right / len(stratum_cases) * 100,
-    })
+    return {
+        'tokens': tokens[:seq_len],
+        'cls_attention_mean': cls_attn_mean[:seq_len],
+        'cls_attention_max': cls_attn_max[:seq_len],
+        'cls_attention_per_head': cls_attn_per_head[:, :seq_len],
+    }
 
-stratum_df = pd.DataFrame(stratum_metrics).sort_values('accuracy_mean', ascending=False)
 
-print(f"{'Stratum':<25} {'N':<6} {'Acc (mean+/-std)':<18} {'F1 (mean+/-std)':<18} {'AW%':<8} {'AR%':<8}")
-print("-"*100)
-for _, row in stratum_df.iterrows():
-    print(f"{row['stratum']:<25} {int(row['n_cases']):<6} {row['accuracy_mean']:.3f}+/-{row['accuracy_std']:.3f}        {row['f1_macro_mean']:.3f}+/-{row['f1_macro_std']:.3f}        {row['always_wrong_pct']:.1f}%    {row['always_right_pct']:.1f}%")
-
-print("\n6.2 Stratum x Outcome Analysis")
-print("-"*80)
-
-for stratum in sorted(df_with_consistency['stratum'].unique()):
-    stratum_cases = df_with_consistency[df_with_consistency['stratum'] == stratum]
+def compute_section_metrics(tokens, attention_mean, attention_max):
+    """
+    Compute RAW DENSITY (mean attention per token) - NOT normalized.
+    Also computes max-based metrics.
+    """
+    section_sum_mean = {'FACTS': 0.0, 'APPLICANT': 0.0, 'DEFENCE': 0.0, 'OTHER': 0.0}
+    section_sum_max = {'FACTS': 0.0, 'APPLICANT': 0.0, 'DEFENCE': 0.0, 'OTHER': 0.0}
+    section_count = {'FACTS': 0, 'APPLICANT': 0, 'DEFENCE': 0, 'OTHER': 0}
+    current_section = 'OTHER'
     
-    print(f"\n{stratum} (n={len(stratum_cases)}):")
-    
-    for outcome, label_val in [('Granted', 0), ('Refused', 1)]:
-        subset = stratum_cases[stratum_cases['y_true'] == label_val]
-        if len(subset) == 0:
+    for token, attn_mean, attn_max in zip(tokens, attention_mean, attention_max):
+        if token == '[FACTS]':
+            current_section = 'FACTS'
+        elif token == '[APPLICANT]':
+            current_section = 'APPLICANT'
+        elif token == '[DEFENCE]':
+            current_section = 'DEFENCE'
+        elif token in ['[CLS]', '[SEP]', '[PAD]']:
             continue
-        
-        always_wrong = len(subset[subset['times_correct'] == 0])
-        always_right = len(subset[subset['times_correct'] == 5])
-        
-        print(f"  {outcome}: n={len(subset)}, AW={always_wrong} ({always_wrong/len(subset)*100:.1f}%), AR={always_right} ({always_right/len(subset)*100:.1f}%)")
-
-# =============================================================================
-# 7. NUMBER OF GROUNDS ANALYSIS
-# =============================================================================
-
-print("\n" + "="*80)
-print("7. PERFORMANCE BY NUMBER OF GROUNDS")
-print("="*80)
-
-df_with_consistency['n_grounds'] = df_with_consistency['law'] + df_with_consistency['evidence'] + df_with_consistency['trial']
-all_preds_merged = all_preds.merge(df_with_consistency[['case_id', 'n_grounds', 'times_correct']], on='case_id', how='left')
-assert len(all_preds_merged) == len(all_preds), f"Merge lost predictions! {len(all_preds)} --> {len(all_preds_merged)}"
-assert all_preds_merged['n_grounds'].notna().all(), "Missing n_grounds after merge!"
-
-print("\n7.1 Accuracy by Number of Grounds")
-print("-"*80)
-print(f"{'N Grounds':<12} {'N Cases':<10} {'Acc (mean+/-std)':<18} {'AW%':<10} {'AR%':<10}")
-print("-"*80)
-
-for n_grounds in sorted(df_with_consistency['n_grounds'].unique()):
-    subset_cases = df_with_consistency[df_with_consistency['n_grounds'] == n_grounds]
+        else:
+            section_sum_mean[current_section] += attn_mean
+            section_sum_max[current_section] += attn_max
+            section_count[current_section] += 1
     
-    # Per-seed accuracy
-    seed_accs = []
-    for seed in all_preds['seed'].unique():
-        subset_preds = all_preds_merged[(all_preds_merged['n_grounds'] == n_grounds) & (all_preds_merged['seed'] == seed)]
-        if len(subset_preds) > 0:
-            seed_accs.append(accuracy_score(subset_preds['y_true'], subset_preds['predicted']))
+    # RAW DENSITY: mean attention per token (NOT normalized to sum=1)
+    raw_density_mean = {}
+    raw_density_max = {}
+    for section in ['FACTS', 'APPLICANT', 'DEFENCE', 'OTHER']:
+        if section_count[section] > 0:
+            raw_density_mean[section] = section_sum_mean[section] / section_count[section]
+            raw_density_max[section] = section_sum_max[section] / section_count[section]
+        else:
+            raw_density_mean[section] = 0.0
+            raw_density_max[section] = 0.0
     
-    aw = len(subset_cases[subset_cases['times_correct'] == 0])
-    ar = len(subset_cases[subset_cases['times_correct'] == 5])
-    
-    print(f"{n_grounds:<12} {len(subset_cases):<10} {np.mean(seed_accs):.3f}+/-{np.std(seed_accs):.3f}        {aw/len(subset_cases)*100:.1f}%      {ar/len(subset_cases)*100:.1f}%")
-
-# =============================================================================
-# 8. DETAILED ERROR ANALYSIS
-# =============================================================================
-
-print("\n" + "="*80)
-print("8. DETAILED ERROR ANALYSIS")
-print("="*80)
-
-always_wrong_cases = df_with_consistency[df_with_consistency['times_correct'] == 0]
-always_right_cases = df_with_consistency[df_with_consistency['times_correct'] == 5]
-
-print(f"\n8.1 Always-Wrong Cases (n={len(always_wrong_cases)})")
-print("-"*60)
-
-# By outcome
-aw_granted = len(always_wrong_cases[always_wrong_cases['y_true'] == 0])
-aw_refused = len(always_wrong_cases[always_wrong_cases['y_true'] == 1])
-print(f"  By True Outcome:")
-print(f"    Granted (model predicted Refused): {aw_granted} ({aw_granted/len(always_wrong_cases)*100:.1f}%)")
-print(f"    Refused (model predicted Granted): {aw_refused} ({aw_refused/len(always_wrong_cases)*100:.1f}%)")
-
-# By stratum
-print(f"\n  By Stratum:")
-for stratum in sorted(always_wrong_cases['stratum'].unique()):
-    n = len(always_wrong_cases[always_wrong_cases['stratum'] == stratum])
-    total_stratum = len(df_with_consistency[df_with_consistency['stratum'] == stratum])
-    print(f"    {stratum}: {n} ({n/total_stratum*100:.1f}% of stratum)")
-
-print(f"\n8.2 Always-Right Cases (n={len(always_right_cases)})")
-print("-"*60)
-
-# By outcome
-ar_granted = len(always_right_cases[always_right_cases['y_true'] == 0])
-ar_refused = len(always_right_cases[always_right_cases['y_true'] == 1])
-print(f"  By True Outcome:")
-print(f"    Granted: {ar_granted} ({ar_granted/len(always_right_cases)*100:.1f}%)")
-print(f"    Refused: {ar_refused} ({ar_refused/len(always_right_cases)*100:.1f}%)")
-
-# =============================================================================
-# 9. COMPARISON WITH SINGLE-SEED BASELINE
-# =============================================================================
-
-print("\n" + "="*80)
-print("9. COMPARISON: SINGLE-SEED vs MULTI-SEED")
-print("="*80)
-
-print("\n" + "-"*80)
-print(f"{'Metric':<25} {'Single-Seed':<15} {'Multi-Seed (Mean+/-Std)':<25} {'Diff':<10}")
-print("-"*80)
-
-# Single-seed values from initial report
-single_seed = {
-    'Accuracy': 0.668,
-    'F1-Macro': 0.657,
-    'F1-Granted': 0.719,
-    'F1-Refused': 0.594,
-}
-
-multi_seed = {
-    'Accuracy': (seed_df['accuracy'].mean(), seed_df['accuracy'].std()),
-    'F1-Macro': (seed_df['f1_macro'].mean(), seed_df['f1_macro'].std()),
-    'F1-Granted': (seed_df['f1_granted'].mean(), seed_df['f1_granted'].std()),
-    'F1-Refused': (seed_df['f1_refused'].mean(), seed_df['f1_refused'].std()),
-}
-
-for metric in single_seed:
-    ss = single_seed[metric]
-    ms_mean, ms_std = multi_seed[metric]
-    diff = ms_mean - ss
-    print(f"{metric:<25} {ss:.3f}           {ms_mean:.3f} +/- {ms_std:.3f}            {diff:+.3f}")
-
-print("\nInterpretation:")
-print("  - Multi-seed CV provides more realistic performance estimates")
-print("  - Single-seed may have benefited from favorable train/test split")
-print("  - Differences indicate initial report overestimated performance")
-
-# =============================================================================
-# 10. SUMMARY TABLES FOR PAPER
-# =============================================================================
-
-print("\n" + "="*80)
-print("10. SUMMARY TABLES FOR PAPER")
-print("="*80)
-
-print("\n" + "="*60)
-print("TABLE 1: Overall Performance (5 seeds x 5 folds)")
-print("="*60)
-print(f"{'Metric':<25} {'Value':<20}")
-print("-"*45)
-print(f"{'Accuracy':<25} {seed_df['accuracy'].mean()*100:.1f}% +/- {seed_df['accuracy'].std()*100:.1f}%")
-print(f"{'F1-Macro':<25} {seed_df['f1_macro'].mean():.3f} +/- {seed_df['f1_macro'].std():.3f}")
-print(f"{'F1-Granted':<25} {seed_df['f1_granted'].mean():.3f} +/- {seed_df['f1_granted'].std():.3f}")
-print(f"{'F1-Refused':<25} {seed_df['f1_refused'].mean():.3f} +/- {seed_df['f1_refused'].std():.3f}")
-print(f"{'Precision-Granted':<25} {seed_df['precision_granted'].mean():.3f} +/- {seed_df['precision_granted'].std():.3f}")
-print(f"{'Precision-Refused':<25} {seed_df['precision_refused'].mean():.3f} +/- {seed_df['precision_refused'].std():.3f}")
-print(f"{'Recall-Granted':<25} {seed_df['recall_granted'].mean():.3f} +/- {seed_df['recall_granted'].std():.3f}")
-print(f"{'Recall-Refused':<25} {seed_df['recall_refused'].mean():.3f} +/- {seed_df['recall_refused'].std():.3f}")
-
-print("\n" + "="*60)
-print("TABLE 2: Consistency Distribution")
-print("="*60)
-total = len(df_with_consistency)
-for tc in range(6):
-    n = len(df_with_consistency[df_with_consistency['times_correct'] == tc])
-    print(f"{tc}/5 correct: {n} ({n/total*100:.1f}%)")
-
-print("\n" + "="*60)
-print("TABLE 3: Error Rate by Outcome")
-print("="*60)
-for outcome, label_val in [('Granted', 0), ('Refused', 1)]:
-    subset = df_with_consistency[df_with_consistency['y_true'] == label_val]
-    aw = len(subset[subset['times_correct'] == 0])
-    print(f"{outcome}: {aw}/{len(subset)} always-wrong ({aw/len(subset)*100:.1f}%)")
-
-print("\n" + "="*60)
-print("TABLE 4: Performance by Number of Grounds")
-print("="*60)
-for n_grounds in sorted(df_with_consistency['n_grounds'].unique()):
-    subset_cases = df_with_consistency[df_with_consistency['n_grounds'] == n_grounds]
-    seed_accs = []
-    for seed in all_preds['seed'].unique():
-        subset_preds = all_preds_merged[(all_preds_merged['n_grounds'] == n_grounds) & (all_preds_merged['seed'] == seed)]
-        if len(subset_preds) > 0:
-            seed_accs.append(accuracy_score(subset_preds['y_true'], subset_preds['predicted']))
-    aw = len(subset_cases[subset_cases['times_correct'] == 0])
-    ar = len(subset_cases[subset_cases['times_correct'] == 5])
-    print(f"{n_grounds} grounds (n={len(subset_cases)}): Acc={np.mean(seed_accs)*100:.1f}%+/-{np.std(seed_accs)*100:.1f}%, AW={aw/len(subset_cases)*100:.1f}%, AR={ar/len(subset_cases)*100:.1f}%")
-
-print("\n" + "="*60)
-print("TABLE 5: Majority Vote Performance")
-print("="*60)
-print(f"Accuracy:          {acc_vote*100:.1f}%")
-print(f"F1-Macro:          {f1_macro_vote:.3f}")
-print(f"F1-Granted:        {f1_granted_vote:.3f}")
-print(f"F1-Refused:        {f1_refused_vote:.3f}")
-print(f"Precision-Granted: {prec_granted_vote:.3f}")
-print(f"Precision-Refused: {prec_refused_vote:.3f}")
-print(f"Recall-Granted:    {rec_granted_vote:.3f}")
-print(f"Recall-Refused:    {rec_refused_vote:.3f}")
-
-# =============================================================================
-# 11. SAVE DETAILED RESULTS TO CSV
-# =============================================================================
-
-print("\n" + "="*80)
-print("11. LINGUISTIC MARKERS ANALYSIS")
-print("="*80)
-
-# Combine all text fields
-df_with_consistency['all_text'] = (
-    df_with_consistency['facts'].fillna('') + ' ' + 
-    df_with_consistency['applicant_reason'].fillna('') + ' ' + 
-    df_with_consistency['defence_reason'].fillna('')
-).str.lower()
-
-# Define phrases to analyze
-phrases = [
-    'factual dispute', 'oral evidence', 'no real prospect', 
-    'compelling reason', 'arguable', 'bound to fail', 
-    'no defence', 'summary judgment', 'triable issue',
-    'real prospect', 'fanciful', 'credibility'
-]
-
-print("\nTable 4: Phrase frequency in errors vs. correct classifications")
-print("-"*80)
-print(f"{'Phrase':<25} {'In Errors':<12} {'In Correct':<12} {'Ratio':<10} {'Interpretation'}")
-print("-"*80)
-
-phrase_results = []
-for phrase in phrases:
-    # Check if phrase appears in text
-    df_with_consistency[f'has_{phrase.replace(" ", "_")}'] = df_with_consistency['all_text'].str.contains(phrase, regex=False).astype(int)
-    
-    # Calculate frequencies
-    errors = df_with_consistency[df_with_consistency['times_correct'] == 0]
-    correct = df_with_consistency[df_with_consistency['times_correct'] == 5]
-    
-    freq_errors = errors[f'has_{phrase.replace(" ", "_")}'].mean() * 100 if len(errors) > 0 else 0
-    freq_correct = correct[f'has_{phrase.replace(" ", "_")}'].mean() * 100 if len(correct) > 0 else 0
-    
-    if freq_correct > 0:
-        ratio = freq_errors / freq_correct
+    # Also compute proportion (for comparison/artifact verification)
+    total_sum = sum(section_sum_mean.values())
+    if total_sum > 0:
+        proportion = {k: v / total_sum for k, v in section_sum_mean.items()}
     else:
-        ratio = float('inf') if freq_errors > 0 else 1.0
+        proportion = {k: 0.0 for k in section_sum_mean}
     
-    interp = "More in errors" if ratio > 1.2 else "More in correct" if ratio < 0.8 else "Similar"
+    return {
+        'raw_density_mean': raw_density_mean,  # THE MEANINGFUL METRIC
+        'raw_density_max': raw_density_max,     # MAX-based density
+        'proportion': proportion,               # For artifact verification
+        'token_counts': section_count,
+    }
+
+
+def get_label_indices(model):
+    """Extract correct label indices by searching id2label for substrings."""
+    id2label = getattr(model.config, 'id2label', {0: 'LABEL_0', 1: 'LABEL_1'})
     
-    phrase_results.append({
-        'phrase': phrase,
-        'freq_errors': freq_errors,
-        'freq_correct': freq_correct,
-        'ratio': ratio
-    })
+    granted_idx = 0  # default
+    refused_idx = 1  # default
     
-    if ratio != float('inf'):
-        print(f"{phrase:<25} {freq_errors:>6.1f}%      {freq_correct:>6.1f}%      {ratio:>5.2f}x    {interp}")
-    else:
-        print(f"{phrase:<25} {freq_errors:>6.1f}%      {freq_correct:>6.1f}%      {'inf':>5}     {interp}")
+    for idx, label in id2label.items():
+        label_lower = str(label).lower()
+        if 'grant' in label_lower:
+            granted_idx = int(idx)
+        elif 'refus' in label_lower or 'denied' in label_lower:
+            refused_idx = int(idx)
+    
+    return granted_idx, refused_idx
 
-# =============================================================================
-# 12. PERFORMANCE BY AREA OF LAW (TOPIC)
-# =============================================================================
 
-print("\n" + "="*80)
-print("12. PERFORMANCE BY AREA OF LAW")
-print("="*80)
+def verify_special_tokens(tokenizer):
+    """Verify special tokens are in vocabulary (not UNK)."""
+    print(f"\n   Verifying special tokens:")
+    unk_id = tokenizer.unk_token_id
+    all_ok = True
+    
+    for token in ["[FACTS]", "[APPLICANT]", "[DEFENCE]"]:
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        status = "✅" if token_id != unk_id else "❌ (UNK!)"
+        print(f"      {token} -> ID {token_id} {status}")
+        if token_id == unk_id:
+            all_ok = False
+    
+    if not all_ok:
+        print("   ⚠️ WARNING: Some special tokens are UNK! Section detection will fail.")
+    
+    return all_ok
 
-# Check if topic columns exist
-if 'primary_topic' in df.columns:
-    df_with_consistency = df_with_consistency.merge(
-        df[['case_id', 'primary_topic']], on='case_id', how='left'
+
+def get_prediction_probs(model, tokenizer, text, device, granted_idx, refused_idx):
+    """Get prediction probabilities with verified label mapping."""
+    model.eval()
+    
+    encoding = tokenizer(text, truncation=True, max_length=MAX_LENGTH,
+                         padding='max_length', return_tensors='pt')
+    
+    input_ids = encoding['input_ids'].to(device)
+    attention_mask = encoding['attention_mask'].to(device)
+    
+    with torch.no_grad():
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        probs = torch.softmax(outputs.logits, dim=-1)
+    
+    pred_idx = torch.argmax(outputs.logits, dim=-1).item()
+    
+    return {
+        'pred': pred_idx,
+        'prob_granted': probs[0, granted_idx].item(),
+        'prob_refused': probs[0, refused_idx].item(),
+    }
+
+
+# ===============================================================================
+# MODEL CACHE
+# ===============================================================================
+
+class ModelCache:
+    """Cache models to avoid reloading. Keeps max N models in memory."""
+    
+    def __init__(self, device, max_models=5):
+        self.cache = {}
+        self.device = device
+        self.max_models = max_models
+        self.access_order = []
+    
+    def get(self, model_path):
+        key = str(model_path)
+        
+        if key in self.cache:
+            # Move to end (most recently used)
+            self.access_order.remove(key)
+            self.access_order.append(key)
+            return self.cache[key]
+        
+        # Load new model with EAGER attention (required for output_attentions)
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_path,
+            attn_implementation="eager"  # Required to get attention weights
+        )
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        model = model.to(self.device)
+        model.eval()
+        
+        # Evict oldest if at capacity
+        if len(self.cache) >= self.max_models:
+            oldest = self.access_order.pop(0)
+            del self.cache[oldest]
+            torch.cuda.empty_cache()
+        
+        self.cache[key] = (model, tokenizer)
+        self.access_order.append(key)
+        
+        return model, tokenizer
+    
+    def clear(self):
+        self.cache.clear()
+        self.access_order.clear()
+        torch.cuda.empty_cache()
+
+
+# ===============================================================================
+# MAIN
+# ===============================================================================
+
+def main():
+    print("\n" + "="*70)
+    print("🔧 FIXED ATTENTION EXTRACTION (v2)")
+    print("="*70)
+    print(f"   Start: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    device = check_gpu()
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    
+    # Check for trained models
+    if not DATA_DIR.exists():
+        print(f"\n❌ Model directory not found: {DATA_DIR}")
+        return
+    
+    # Load predictions to know which model predicted each case
+    preds_path = DATA_DIR / "all_predictions.csv"
+    if not preds_path.exists():
+        print(f"\n❌ Predictions file not found: {preds_path}")
+        return
+    
+    all_preds = pd.read_csv(preds_path)
+    print(f"\n📂 Loaded {len(all_preds)} predictions from all_predictions.csv")
+    print(f"   Columns: {list(all_preds.columns)}")
+    
+    # Load original data
+    print(f"\n📂 Loading original data...")
+    df = pd.read_pickle(ORIGINAL_DATA)
+    outcomes = ["summary judgment granted", "summary judgment refused"]
+    df = df[df["outcome"].isin(outcomes)].copy()
+    df["label"] = df["outcome"].map({"summary judgment granted": 0, "summary judgment refused": 1})
+    df['case_id'] = range(len(df))
+    print(f"   Loaded {len(df)} cases")
+    
+    # Load consistency data
+    consistency = pd.read_csv(DATA_DIR / "case_consistency.csv")
+    df = df.merge(consistency[['case_id', 'times_correct', 'stratum']], on='case_id', how='left')
+    
+    # Build model path lookup
+    model_paths = {}
+    for seed_dir in DATA_DIR.glob("seed_*"):
+        seed = int(seed_dir.name.split("_")[1])
+        for fold_dir in seed_dir.glob("fold_*"):
+            fold = int(fold_dir.name.split("_")[1])
+            model_path = fold_dir / "best_model"
+            if model_path.exists():
+                model_paths[(seed, fold)] = model_path
+    
+    print(f"   Found {len(model_paths)} trained models")
+    
+    # Verify label mapping and special tokens from first model
+    first_path = list(model_paths.values())[0]
+    test_model = AutoModelForSequenceClassification.from_pretrained(
+        first_path,
+        attn_implementation="eager"  # Required for attention extraction
     )
+    test_tokenizer = AutoTokenizer.from_pretrained(first_path)
     
-    print("\nTable 7: Performance by area of law")
-    print("-"*80)
-    print(f"{'Area of Law':<25} {'Cases':<8} {'AW':<6} {'AR':<6} {'Error Rate':<12} {'AR Rate':<10}")
-    print("-"*80)
+    # Verify special tokens
+    tokens_ok = verify_special_tokens(test_tokenizer)
+    if not tokens_ok:
+        print("\n   ❌ Special tokens not found! Cannot continue.")
+        return
     
-    topic_results = []
-    for topic in df_with_consistency['primary_topic'].dropna().unique():
-        subset = df_with_consistency[df_with_consistency['primary_topic'] == topic]
-        if len(subset) < 10:  # Skip very small categories
+    # Get label indices
+    granted_idx, refused_idx = get_label_indices(test_model)
+    print(f"\n📋 Label mapping:")
+    print(f"   id2label: {test_model.config.id2label}")
+    print(f"   granted_idx: {granted_idx}, refused_idx: {refused_idx}")
+    
+    del test_model, test_tokenizer
+    torch.cuda.empty_cache()
+    
+    # =========================================================================
+    # EXTRACT ATTENTION - LOOP BY MODEL (not by case) to avoid reloading
+    # =========================================================================
+    
+    print(f"\n🔬 Extracting attention (loading each model ONCE)...")
+    
+    results = []
+    
+    # Build quick lookup for case data
+    df_by_id = df.set_index('case_id')
+    
+    # Group predictions by (seed, fold) so each model loads ONCE
+    model_groups = all_preds.groupby(['seed', 'fold'])
+    
+    for (seed, fold), preds_group in tqdm(model_groups, total=len(model_groups), desc="Models"):
+        model_key = (int(seed), int(fold))
+        if model_key not in model_paths:
             continue
         
-        aw = len(subset[subset['times_correct'] == 0])
-        ar = len(subset[subset['times_correct'] == 5])
+        # Load model ONCE for all cases it predicted
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_paths[model_key],
+            attn_implementation="eager"
+        )
+        tokenizer = AutoTokenizer.from_pretrained(model_paths[model_key])
+        model = model.to(device)
+        model.eval()
         
-        topic_results.append({
-            'topic': topic,
-            'n_cases': len(subset),
-            'always_wrong': aw,
-            'always_right': ar,
-            'error_rate': aw / len(subset) * 100,
-            'ar_rate': ar / len(subset) * 100
-        })
-    
-    # Sort by error rate descending
-    topic_results = sorted(topic_results, key=lambda x: x['error_rate'], reverse=True)
-    
-    for r in topic_results:
-        print(f"{r['topic']:<25} {r['n_cases']:<8} {r['always_wrong']:<6} {r['always_right']:<6} {r['error_rate']:>6.1f}%      {r['ar_rate']:>6.1f}%")
-else:
-    print("\n  WARNING 'primary_topic' column not found in dataset")
-    print("  Checking for alternative topic columns...")
-    topic_cols = [c for c in df.columns if 'topic' in c.lower()]
-    print(f"  Available: {topic_cols if topic_cols else 'None'}")
-
-# =============================================================================
-# 13. FALSE POSITIVE / FALSE NEGATIVE BREAKDOWN BY STRATUM
-# =============================================================================
-
-print("\n" + "="*80)
-print("13. FP/FN BREAKDOWN BY STRATUM (Appendix C)")
-print("="*80)
-
-# For always-wrong cases, determine if FP or FN
-# FP = predicted Granted (0), actually Refused (1) --> label=1
-# FN = predicted Refused (1), actually Granted (0) --> label=0
-
-always_wrong = df_with_consistency[df_with_consistency['times_correct'] == 0].copy()
-
-# FN: True=Granted (label=0), model consistently predicted Refused
-fn_cases = always_wrong[always_wrong['y_true'] == 0]
-# FP: True=Refused (label=1), model consistently predicted Granted  
-fp_cases = always_wrong[always_wrong['y_true'] == 1]
-
-print(f"\nTotal Always-Wrong: {len(always_wrong)}")
-print(f"  False Negatives (True=Granted, Pred=Refused): {len(fn_cases)}")
-print(f"  False Positives (True=Refused, Pred=Granted): {len(fp_cases)}")
-
-print("\n" + "-"*60)
-print("FALSE NEGATIVES by Stratum (predicted Refused, actually Granted)")
-print("-"*60)
-print(f"{'Stratum':<30} {'Count':<10} {'% of FN':<10}")
-print("-"*50)
-
-for stratum in sorted(fn_cases['stratum'].unique()):
-    n = len(fn_cases[fn_cases['stratum'] == stratum])
-    pct = n / len(fn_cases) * 100 if len(fn_cases) > 0 else 0
-    print(f"{stratum:<30} {n:<10} {pct:>6.1f}%")
-
-print("\n" + "-"*60)
-print("FALSE POSITIVES by Stratum (predicted Granted, actually Refused)")
-print("-"*60)
-print(f"{'Stratum':<30} {'Count':<10} {'% of FP':<10}")
-print("-"*50)
-
-for stratum in sorted(fp_cases['stratum'].unique()):
-    n = len(fp_cases[fp_cases['stratum'] == stratum])
-    pct = n / len(fp_cases) * 100 if len(fp_cases) > 0 else 0
-    print(f"{stratum:<30} {n:<10} {pct:>6.1f}%")
-
-# =============================================================================
-# 14. DISTRIBUTION TABLE (Table A1)
-# =============================================================================
-
-print("\n" + "="*80)
-print("14. DECISION FACTOR DISTRIBUTION (Table A1)")
-print("="*80)
-
-print("\n" + "-"*80)
-print(f"{'LAW':<6} {'EVIDENCE':<10} {'TRIAL':<8} {'Count':<10} {'%':<8} {'Interpretation'}")
-print("-"*80)
-
-# Create all 8 combinations
-for l in [0, 1]:
-    for e in [0, 1]:
-        for t in [0, 1]:
-            subset = df_with_consistency[
-                (df_with_consistency['law'] == l) & 
-                (df_with_consistency['evidence'] == e) & 
-                (df_with_consistency['trial'] == t)
-            ]
-            n = len(subset)
-            pct = n / len(df_with_consistency) * 100
+        # Process all cases predicted by this model
+        for _, pred_row in preds_group.iterrows():
+            case_id = int(pred_row['case_id'])
+            case_row = df_by_id.loc[case_id]
             
-            # Interpretation
-            parts = []
-            if l: parts.append('Law')
-            if e: parts.append('Evidence')
-            if t: parts.append('Trial')
-            interp = ' + '.join(parts) if parts else 'None cited'
+            text = format_text(case_row)
             
-            print(f"{l:<6} {e:<10} {t:<8} {n:<10} {pct:>5.1f}%   {interp}")
-
-# =============================================================================
-# 15. SAVE ALL RESULTS TO CSV
-# =============================================================================
-
-print("\n" + "="*80)
-print("15. SAVING DETAILED RESULTS")
-print("="*80)
-
-# Save all metrics
-seed_df.to_csv('multiseed_per_seed_metrics.csv', index=False)
-fold_df.to_csv('multiseed_per_fold_metrics.csv', index=False)
-stratum_df.to_csv('multiseed_per_stratum_metrics.csv', index=False)
-
-print("\nSaved:")
-print("  - multiseed_per_seed_metrics.csv")
-print("  - multiseed_per_fold_metrics.csv")
-print("  - multiseed_per_stratum_metrics.csv")
-
-# =============================================================================
-# 16. DOMAIN-SPECIFIC KEYWORD ANALYSIS
-# =============================================================================
-
-print("\n" + "="*80)
-print("16. DOMAIN-SPECIFIC KEYWORD ANALYSIS (Domain-Conditioned Bias)")
-print("="*80)
-
-# Keywords identified as associated with errors in statistical analysis
-domain_keywords = {
-    'binding': r'\bbinding\b',
-    'defamatory': r'\bdefamatory\b',
-    'settlement': r'\bsettlement\b',
-    'guarantee': r'\bguarantee\b',
-    'property': r'\bproperty\b',
-    'jurisdiction': r'\bjurisdiction\b',
-}
-
-print("\nKeyword x Outcome x Error Rate Analysis:")
-print("-"*90)
-print(f"{'Keyword':<15} {'Has KW':<8} {'AW':<6} {'AW%':<8} {'Refused+KW':<12} {'R+KW AW':<10} {'R+KW AW%':<10}")
-print("-"*90)
-
-for keyword, pattern in domain_keywords.items():
-    df_with_consistency[f'has_{keyword}'] = df_with_consistency['all_text'].str.contains(pattern, case=False, regex=True).astype(int)
+            attn_info = extract_attention(model, tokenizer, text, device)
+            metrics = compute_section_metrics(
+                attn_info['tokens'],
+                attn_info['cls_attention_mean'],
+                attn_info['cls_attention_max']
+            )
+            
+            results.append({
+                'case_id': case_id,
+                'seed': int(seed),
+                'fold': int(fold),
+                'label': int(case_row['label']),
+                'times_correct': case_row.get('times_correct', None),
+                'stratum': case_row.get('stratum', None),
+                'correct': pred_row.get('correct', None),
+                # RAW DENSITY (mean-based)
+                'raw_density_FACTS': metrics['raw_density_mean']['FACTS'],
+                'raw_density_APPLICANT': metrics['raw_density_mean']['APPLICANT'],
+                'raw_density_DEFENCE': metrics['raw_density_mean']['DEFENCE'],
+                # RAW DENSITY (max-based)
+                'raw_density_max_FACTS': metrics['raw_density_max']['FACTS'],
+                'raw_density_max_APPLICANT': metrics['raw_density_max']['APPLICANT'],
+                'raw_density_max_DEFENCE': metrics['raw_density_max']['DEFENCE'],
+                # Proportion (artifact)
+                'proportion_FACTS': metrics['proportion']['FACTS'],
+                'proportion_APPLICANT': metrics['proportion']['APPLICANT'],
+                'proportion_DEFENCE': metrics['proportion']['DEFENCE'],
+                # Token counts
+                'tokens_FACTS': metrics['token_counts']['FACTS'],
+                'tokens_APPLICANT': metrics['token_counts']['APPLICANT'],
+                'tokens_DEFENCE': metrics['token_counts']['DEFENCE'],
+            })
+        
+        # Free model after processing all its cases
+        del model, tokenizer
+        torch.cuda.empty_cache()
     
-    # Overall for keyword
-    has_kw = df_with_consistency[df_with_consistency[f'has_{keyword}'] == 1]
-    has_kw_aw = len(has_kw[has_kw['times_correct'] == 0])
-    has_kw_pct = has_kw_aw / len(has_kw) * 100 if len(has_kw) > 0 else 0
+    results_df = pd.DataFrame(results)
+    results_df.to_csv(OUTPUT_DIR / "attention_per_prediction.csv", index=False)
+    print(f"   ✅ Saved: {OUTPUT_DIR}/attention_per_prediction.csv")
     
-    # Refused + keyword (domain-conditioned)
-    refused_kw = df_with_consistency[(df_with_consistency[f'has_{keyword}'] == 1) & (df_with_consistency['y_true'] == 1)]
-    refused_kw_aw = len(refused_kw[refused_kw['times_correct'] == 0])
-    refused_kw_pct = refused_kw_aw / len(refused_kw) * 100 if len(refused_kw) > 0 else 0
+    # Aggregate per case (mean across seeds)
+    case_summary = results_df.groupby('case_id').agg({
+        'label': 'first',
+        'times_correct': 'first',
+        'stratum': 'first',
+        'raw_density_FACTS': 'mean',
+        'raw_density_APPLICANT': 'mean',
+        'raw_density_DEFENCE': 'mean',
+        'raw_density_max_FACTS': 'mean',
+        'raw_density_max_APPLICANT': 'mean',
+        'raw_density_max_DEFENCE': 'mean',
+        'proportion_FACTS': 'mean',
+        'proportion_APPLICANT': 'mean',
+        'proportion_DEFENCE': 'mean',
+        'tokens_FACTS': 'mean',
+        'tokens_APPLICANT': 'mean',
+        'tokens_DEFENCE': 'mean',
+    }).reset_index()
     
-    print(f"{keyword:<15} {len(has_kw):<8} {has_kw_aw:<6} {has_kw_pct:.1f}%    {len(refused_kw):<12} {refused_kw_aw:<10} {refused_kw_pct:.1f}%")
+    case_summary.to_csv(OUTPUT_DIR / "attention_per_case.csv", index=False)
+    print(f"   ✅ Saved: {OUTPUT_DIR}/attention_per_case.csv")
+    
+    # =========================================================================
+    # ANALYSIS
+    # =========================================================================
+    
+    print(f"\n{'='*70}")
+    print("📊 ANALYSIS")
+    print(f"{'='*70}")
+    
+    # Verify artifact: proportion ≈ token count ratio
+    print(f"\n   TOKEN COUNT RATIOS (explains proportion artifact):")
+    total_facts = case_summary['tokens_FACTS'].sum()
+    total_app = case_summary['tokens_APPLICANT'].sum()
+    total_def = case_summary['tokens_DEFENCE'].sum()
+    total_all = total_facts + total_app + total_def
+    
+    print(f"   FACTS:     {total_facts/total_all:.1%} of tokens")
+    print(f"   APPLICANT: {total_app/total_all:.1%} of tokens")
+    print(f"   DEFENCE:   {total_def/total_all:.1%} of tokens")
+    
+    # Proportion (artifact)
+    print(f"\n   PROPORTION (artifact - should match token ratios above):")
+    print(f"   {'Correct':<10} {'N':<6} {'FACTS':<10} {'APPLICANT':<12} {'DEFENCE':<10}")
+    print(f"   {'-'*48}")
+    
+    for tc in sorted(case_summary['times_correct'].dropna().unique()):
+        subset = case_summary[case_summary['times_correct'] == tc]
+        print(f"   {int(tc)}/5       {len(subset):<6} "
+              f"{subset['proportion_FACTS'].mean():.1%}      "
+              f"{subset['proportion_APPLICANT'].mean():.1%}        "
+              f"{subset['proportion_DEFENCE'].mean():.1%}")
+    
+    # Raw density (meaningful - NOT normalized)
+    print(f"\n   RAW DENSITY (mean attention per token - NOT normalized):")
+    print(f"   {'Correct':<10} {'N':<6} {'FACTS':<12} {'APPLICANT':<14} {'DEFENCE':<12}")
+    print(f"   {'-'*54}")
+    
+    for tc in sorted(case_summary['times_correct'].dropna().unique()):
+        subset = case_summary[case_summary['times_correct'] == tc]
+        print(f"   {int(tc)}/5       {len(subset):<6} "
+              f"{subset['raw_density_FACTS'].mean():.4f}       "
+              f"{subset['raw_density_APPLICANT'].mean():.4f}         "
+              f"{subset['raw_density_DEFENCE'].mean():.4f}")
+    
+    # Max-based density
+    print(f"\n   RAW DENSITY (max across heads - reveals selective attention):")
+    print(f"   {'Correct':<10} {'N':<6} {'FACTS':<12} {'APPLICANT':<14} {'DEFENCE':<12}")
+    print(f"   {'-'*54}")
+    
+    for tc in sorted(case_summary['times_correct'].dropna().unique()):
+        subset = case_summary[case_summary['times_correct'] == tc]
+        print(f"   {int(tc)}/5       {len(subset):<6} "
+              f"{subset['raw_density_max_FACTS'].mean():.4f}       "
+              f"{subset['raw_density_max_APPLICANT'].mean():.4f}         "
+              f"{subset['raw_density_max_DEFENCE'].mean():.4f}")
+    
+    # =========================================================================
+    # ABLATION STUDY - LOOP BY MODEL (not by case)
+    # =========================================================================
+    
+    print(f"\n{'='*70}")
+    print(f"🔬 ABLATION STUDY (masking with {MASK_LENGTH} [MASK] tokens)")
+    print(f"{'='*70}")
+    
+    # Sample cases stratified by consistency
+    sample_ids = set()
+    for tc in [0, 1, 2, 3, 4, 5]:
+        tc_cases = case_summary[case_summary['times_correct'] == tc]['case_id'].tolist()
+        sample_ids.update(tc_cases[:min(40, len(tc_cases))])
+    
+    print(f"\n   Running ablation on {len(sample_ids)} sampled cases...")
+    print(f"   Loading each model ONCE (25 models total)")
+    
+    # Get predictions for sampled cases only
+    sample_preds = all_preds[all_preds['case_id'].isin(sample_ids)]
+    
+    # Store per-case, per-model results
+    ablation_raw = []
+    
+    # Group by model
+    ablation_groups = sample_preds.groupby(['seed', 'fold'])
+    
+    for (seed, fold), preds_group in tqdm(ablation_groups, total=len(ablation_groups), desc="Ablation"):
+        model_key = (int(seed), int(fold))
+        if model_key not in model_paths:
+            continue
+        
+        # Load model ONCE
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_paths[model_key],
+            attn_implementation="eager"
+        )
+        tokenizer = AutoTokenizer.from_pretrained(model_paths[model_key])
+        model = model.to(device)
+        model.eval()
+        
+        g_idx, r_idx = get_label_indices(model)
+        
+        for _, pred_row in preds_group.iterrows():
+            case_id = int(pred_row['case_id'])
+            case_row = df_by_id.loc[case_id]
+            text = format_text(case_row)
+            
+            # Baseline
+            base = get_prediction_probs(model, tokenizer, text, device, g_idx, r_idx)
+            
+            # Mask each section
+            for section in ['FACTS', 'APPLICANT', 'DEFENCE']:
+                masked_text = mask_section(text, section, n_masks=MASK_LENGTH)
+                masked = get_prediction_probs(model, tokenizer, masked_text, device, g_idx, r_idx)
+                
+                ablation_raw.append({
+                    'case_id': case_id,
+                    'seed': int(seed),
+                    'fold': int(fold),
+                    'label': int(case_row['label']),
+                    'times_correct': case_row.get('times_correct', None),
+                    'section': section,
+                    'delta': masked['prob_refused'] - base['prob_refused'],
+                    'flipped': int(masked['pred'] != base['pred']),
+                })
+        
+        del model, tokenizer
+        torch.cuda.empty_cache()
+    
+    # Aggregate ablation results per case
+    ablation_raw_df = pd.DataFrame(ablation_raw)
+    
+    # Pivot to get one row per case
+    ablation_results = []
+    for case_id in sample_ids:
+        case_data = ablation_raw_df[ablation_raw_df['case_id'] == case_id]
+        if len(case_data) == 0:
+            continue
+        
+        case_row = df_by_id.loc[case_id]
+        result = {
+            'case_id': case_id,
+            'label': int(case_row['label']),
+            'times_correct': case_row.get('times_correct', None),
+            'n_models': len(case_data) // 3,  # 3 sections per model
+        }
+        
+        for section in ['FACTS', 'APPLICANT', 'DEFENCE']:
+            section_data = case_data[case_data['section'] == section]
+            result[f'{section.lower()}_delta'] = section_data['delta'].mean()
+            result[f'{section.lower()}_flipped'] = section_data['flipped'].mean()
+        
+        ablation_results.append(result)
+    
+    ablation_df = pd.DataFrame(ablation_results)
+    ablation_df.to_csv(OUTPUT_DIR / "ablation_results.csv", index=False)
+    print(f"   ✅ Saved: {OUTPUT_DIR}/ablation_results.csv")
+    
+    # Analyze ablation
+    print(f"\n   ABLATION IMPACT (Δ P(refused) when section masked):")
+    print(f"   {'Correct':<10} {'N':<6} {'FACTS Δ':<12} {'APPLICANT Δ':<14} {'DEFENCE Δ':<12}")
+    print(f"   {'-'*54}")
+    
+    for tc in sorted(ablation_df['times_correct'].dropna().unique()):
+        subset = ablation_df[ablation_df['times_correct'] == tc]
+        print(f"   {int(tc)}/5       {len(subset):<6} "
+              f"{subset['facts_delta'].mean():+.4f}       "
+              f"{subset['applicant_delta'].mean():+.4f}         "
+              f"{subset['defence_delta'].mean():+.4f}")
+    
+    print(f"\n   FLIP RATE (% predictions that change when section masked):")
+    print(f"   {'Correct':<10} {'N':<6} {'FACTS':<10} {'APPLICANT':<12} {'DEFENCE':<10}")
+    print(f"   {'-'*48}")
+    
+    for tc in sorted(ablation_df['times_correct'].dropna().unique()):
+        subset = ablation_df[ablation_df['times_correct'] == tc]
+        print(f"   {int(tc)}/5       {len(subset):<6} "
+              f"{subset['facts_flipped'].mean():.1%}      "
+              f"{subset['applicant_flipped'].mean():.1%}        "
+              f"{subset['defence_flipped'].mean():.1%}")
+    
+    # Compare always-wrong vs always-right
+    print(f"\n{'='*70}")
+    print("📊 ALWAYS WRONG (0/5) vs ALWAYS RIGHT (5/5)")
+    print(f"{'='*70}")
+    
+    aw = case_summary[case_summary['times_correct'] == 0]
+    ar = case_summary[case_summary['times_correct'] == 5]
+    
+    print(f"\n   RAW DENSITY (mean attention per token):")
+    print(f"   {'Group':<15} {'N':<6} {'FACTS':<12} {'APPLICANT':<14} {'DEFENCE':<12}")
+    print(f"   {'-'*59}")
+    
+    if len(aw) > 0:
+        print(f"   {'Always Wrong':<15} {len(aw):<6} "
+              f"{aw['raw_density_FACTS'].mean():.4f}       "
+              f"{aw['raw_density_APPLICANT'].mean():.4f}         "
+              f"{aw['raw_density_DEFENCE'].mean():.4f}")
+    
+    if len(ar) > 0:
+        print(f"   {'Always Right':<15} {len(ar):<6} "
+              f"{ar['raw_density_FACTS'].mean():.4f}       "
+              f"{ar['raw_density_APPLICANT'].mean():.4f}         "
+              f"{ar['raw_density_DEFENCE'].mean():.4f}")
+    
+    # Ablation comparison
+    aw_abl = ablation_df[ablation_df['times_correct'] == 0]
+    ar_abl = ablation_df[ablation_df['times_correct'] == 5]
+    
+    print(f"\n   ABLATION IMPACT:")
+    print(f"   {'Group':<15} {'N':<6} {'FACTS Δ':<12} {'APPLICANT Δ':<14} {'DEFENCE Δ':<12}")
+    print(f"   {'-'*59}")
+    
+    if len(aw_abl) > 0:
+        print(f"   {'Always Wrong':<15} {len(aw_abl):<6} "
+              f"{aw_abl['facts_delta'].mean():+.4f}       "
+              f"{aw_abl['applicant_delta'].mean():+.4f}         "
+              f"{aw_abl['defence_delta'].mean():+.4f}")
+    
+    if len(ar_abl) > 0:
+        print(f"   {'Always Right':<15} {len(ar_abl):<6} "
+              f"{ar_abl['facts_delta'].mean():+.4f}       "
+              f"{ar_abl['applicant_delta'].mean():+.4f}         "
+              f"{ar_abl['defence_delta'].mean():+.4f}")
+    
+    print(f"\n{'='*70}")
+    print("✅ ANALYSIS COMPLETE")
+    print(f"{'='*70}")
+    print(f"\n   Output files in: {OUTPUT_DIR}/")
+    print(f"   - attention_per_prediction.csv (raw density per seed/fold)")
+    print(f"   - attention_per_case.csv (aggregated per case)")
+    print(f"   - ablation_results.csv (masking impact)")
+    print(f"\n   End: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-print("\nNote: 'binding' + REFUSED shows elevated error rate (domain-conditioned bias)")
 
-print("\n" + "="*80)
-print("EXTRACTION COMPLETE")
-print("="*80)
-
+if __name__ == "__main__":
+    main()

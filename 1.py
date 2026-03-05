@@ -45,19 +45,6 @@ df['all_text'] = (df['facts'].fillna('') + ' ' +
                   df['applicant_reason'].fillna('') + ' ' + 
                   df['defence_reason'].fillna('')).str.lower()
 
-# Extract L/E/T from decision_reason_categories_clean
-# Format is: "LAW=1 EVIDENCE=1 TRIAL=0"
-if 'decision_reason_categories_clean' in df.columns:
-    df['law'] = df['decision_reason_categories_clean'].str.extract(r'LAW=(\d)')[0].astype(int)
-    df['evidence'] = df['decision_reason_categories_clean'].str.extract(r'EVIDENCE=(\d)')[0].astype(int)
-    df['trial'] = df['decision_reason_categories_clean'].str.extract(r'TRIAL=(\d)')[0].astype(int)
-    print(f"OK Extracted L/E/T: LAW={df['law'].sum()}, EVIDENCE={df['evidence'].sum()}, TRIAL={df['trial'].sum()}")
-else:
-    print("WARNING: decision_reason_categories_clean not found, creating dummy L/E/T")
-    df['law'] = 0
-    df['evidence'] = 0
-    df['trial'] = 0
-
 # Add keyword flags with word boundaries
 for kw in ['binding', 'defamatory', 'settlement', 'property']:
     df[f'has_{kw}'] = df['all_text'].str.contains(rf'\b{kw}\b', regex=True).astype(int)

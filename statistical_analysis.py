@@ -1,462 +1,327 @@
 #!/usr/bin/env python3
 """
-Statistical Significance Testing for Legal-BERT Analysis
-
-Tier 1: Necessary
-- Chi-square tests for keyword x always-wrong
-- Logistic regression with interaction
-- Wilson confidence intervals
-
-Tier 2: Enhancements  
-- Calibration analysis (ECE)
-- Per-fold distribution check
+COMPLETE PAPER VERIFICATION - With label consistency check
+Single source of truth: pickle file for labels
 """
-
 import pandas as pd
 import numpy as np
 from scipy import stats
-from scipy.stats import chi2_contingency, fisher_exact
-import statsmodels.api as sm
-from statsmodels.stats.proportion import proportion_confint
-from statsmodels.stats.multitest import multipletests
+from sklearn.metrics import accuracy_score, f1_score
+from sklearn.feature_extraction.text import CountVectorizer
+import re
 import warnings
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
 
-# Load data
-df = pd.read_pickle('sj_231025.pkl')
-df = df[df['outcome'].isin(['summary judgment granted', 'summary judgment refused'])].copy()
-df['case_id'] = range(len(df))
-n_cases_original = len(df)
+PREDICTIONS = "legalbert_multiseed_attention/all_predictions.csv"
+CONSISTENCY = "legalbert_multiseed_attention/case_consistency.csv"
+ORIGINAL = "sj_231025.pkl"
+ATTENTION = "attention_fixed_v2/attention_per_case.csv"
+ABLATION = "attention_fixed_v2/ablation_results.csv"
 
-consistency = pd.read_csv('legalbert_multiseed_attention/case_consistency.csv')
-df = df.merge(consistency[['case_id', 'times_correct']], on='case_id', how='left')
+report = []
+passes = fails = warns = 0
 
-# Validate merge
-assert len(df) == n_cases_original, f"Merge lost cases! {n_cases_original} --> {len(df)}"
-missing = df['times_correct'].isna().sum()
-if missing > 0:
-    raise ValueError(f"FATAL: {missing} cases missing from case_consistency.csv!")
-print(f"OK Loaded {len(df)} cases with consistency data")
+def log(m):
+    print(m)
+    report.append(m)
 
-# Create key variables
-df['always_wrong'] = (df['times_correct'] == 0).astype(int)
-df['refused'] = (df['outcome'] == 'summary judgment refused').astype(int)
-df['all_text'] = (df['facts'].fillna('') + ' ' + 
-                  df['applicant_reason'].fillna('') + ' ' + 
-                  df['defence_reason'].fillna('')).str.lower()
-
-# Extract L/E/T from decision_reason_categories_clean
-# Format is: "LAW=1 EVIDENCE=1 TRIAL=0"
-if 'decision_reason_categories_clean' in df.columns:
-    df['law'] = df['decision_reason_categories_clean'].str.extract(r'LAW=(\d)')[0].astype(int)
-    df['evidence'] = df['decision_reason_categories_clean'].str.extract(r'EVIDENCE=(\d)')[0].astype(int)
-    df['trial'] = df['decision_reason_categories_clean'].str.extract(r'TRIAL=(\d)')[0].astype(int)
-    print(f"OK Extracted L/E/T: LAW={df['law'].sum()}, EVIDENCE={df['evidence'].sum()}, TRIAL={df['trial'].sum()}")
-else:
-    print("WARNING: decision_reason_categories_clean not found, creating dummy L/E/T")
-    df['law'] = 0
-    df['evidence'] = 0
-    df['trial'] = 0
-
-# Add keyword flags with word boundaries
-for kw in ['binding', 'defamatory', 'settlement', 'property']:
-    df[f'has_{kw}'] = df['all_text'].str.contains(rf'\b{kw}\b', regex=True).astype(int)
-
-print("="*70)
-print("TIER 1: STATISTICAL SIGNIFICANCE TESTING")
-print("="*70)
-
-# =============================================================================
-# 1. CHI-SQUARE TESTS
-# =============================================================================
-
-print("\n" + "="*70)
-print("1. CHI-SQUARE TESTS: Keyword x Always-Wrong")
-print("="*70)
-
-def chi_square_analysis(df, keyword_col, outcome_col='always_wrong'):
-    """Perform chi-square test and compute odds ratio with CI."""
-    
-    # Create contingency table - FORCE both levels to exist
-    contingency = pd.crosstab(df[keyword_col], df[outcome_col]).reindex(
-        index=[0, 1], columns=[0, 1], fill_value=0
-    )
-    
-    # Chi-square test
-    chi2, p, dof, expected = chi2_contingency(contingency)
-    
-    # Fisher's exact test (more reliable for small samples)
-    odds_ratio, fisher_p = fisher_exact(contingency)
-    
-    # Extract cells using .loc for safety
-    a = contingency.loc[1, 1]  # keyword & wrong
-    b = contingency.loc[1, 0]  # keyword & right
-    c = contingency.loc[0, 1]  # no keyword & wrong
-    d = contingency.loc[0, 0]  # no keyword & right
-    
-    # Haldane-Anscombe correction for zero cells
-    if a == 0 or b == 0 or c == 0 or d == 0:
-        a_adj, b_adj, c_adj, d_adj = a + 0.5, b + 0.5, c + 0.5, d + 0.5
-    else:
-        a_adj, b_adj, c_adj, d_adj = a, b, c, d
-    
-    # Compute OR and 95% CI using log transformation
-    or_adj = (a_adj * d_adj) / (b_adj * c_adj)
-    log_or = np.log(or_adj)
-    se_log_or = np.sqrt(1/a_adj + 1/b_adj + 1/c_adj + 1/d_adj)
-    ci_low = np.exp(log_or - 1.96 * se_log_or)
-    ci_high = np.exp(log_or + 1.96 * se_log_or)
-    
-    return {
-        'chi2': chi2,
-        'p_value': p,
-        'fisher_p': fisher_p,
-        'expected': expected,
-        'use_fisher': (expected < 5).any(),  # True if any expected count < 5
-        'odds_ratio': odds_ratio,
-        'ci_low': ci_low,
-        'ci_high': ci_high,
-        'contingency': contingency
-    }
-
-chi_square_results = []
-for keyword in ['binding', 'defamatory', 'settlement']:
-    col = f'has_{keyword}'
-    result = chi_square_analysis(df, col)
-    result['keyword'] = keyword
-    
-    # Determine primary p-value based on expected counts
-    result['primary_p'] = result['fisher_p'] if result['use_fisher'] else result['p_value']
-    chi_square_results.append(result)
-    
-    print(f"\n{keyword.upper()}")
-    print(f"  Contingency table:")
-    print(f"                    Not Wrong    Wrong")
-    print(f"  No {keyword:<12} {result['contingency'].loc[0,0]:>8}    {result['contingency'].loc[0,1]:>5}")
-    print(f"  Has {keyword:<11} {result['contingency'].loc[1,0]:>8}    {result['contingency'].loc[1,1]:>5}")
-    print(f"\n  chi2(df=1) = {result['chi2']:.2f}, p = {result['p_value']:.4f}")
-    print(f"  Fisher's exact p = {result['fisher_p']:.4f}")
-    
-    # Report which test is primary
-    if result['use_fisher']:
-        print(f"  WARNING Expected count < 5 detected, using Fisher as primary test")
-        print(f"  PRIMARY p = {result['primary_p']:.4f} (Fisher)")
-    else:
-        print(f"  PRIMARY p = {result['primary_p']:.4f} (chi2)")
-    
-    print(f"  Odds Ratio = {result['odds_ratio']:.2f} [95% CI: {result['ci_low']:.2f}-{result['ci_high']:.2f}]")
-    
-    if result['primary_p'] < 0.05:
-        print(f"  OK SIGNIFICANT at alpha=0.05")
-    else:
-        print(f"  WARNING Not significant at alpha=0.05")
-
-# Multiple testing correction (Benjamini-Hochberg)
-print("\n" + "-"*50)
-print("MULTIPLE TESTING CORRECTION (Benjamini-Hochberg FDR)")
-print("-"*50)
-
-p_values = [r['primary_p'] for r in chi_square_results]  # Use primary_p
-keywords = [r['keyword'] for r in chi_square_results]
-reject, p_corrected, _, _ = multipletests(p_values, method='fdr_bh')
-
-print(f"\n  {'Keyword':<15} {'Raw p':<12} {'Adjusted p':<12} {'Significant':<12}")
-print(f"  {'-'*51}")
-for kw, raw_p, adj_p, sig in zip(keywords, p_values, p_corrected, reject):
-    sig_str = "OK Yes" if sig else "No"
-    print(f"  {kw:<15} {raw_p:<12.4f} {adj_p:<12.4f} {sig_str:<12}")
-
-# =============================================================================
-# 2. LOGISTIC REGRESSION WITH INTERACTION
-# =============================================================================
-
-print("\n" + "="*70)
-print("2. LOGISTIC REGRESSION: AlwaysWrong ~ Outcome + Keyword + Interaction")
-print("   (with stratum controls: law, evidence, trial)")
-print("="*70)
-
-for keyword in ['binding', 'defamatory']:
-    print(f"\n{keyword.upper()} ANALYSIS")
-    print("-"*50)
-    
-    # Prepare data WITH STRATUM CONTROLS
-    X = df[['refused', 'law', 'evidence', 'trial', f'has_{keyword}']].copy()
-    X['interaction'] = X['refused'] * X[f'has_{keyword}']
-    X = sm.add_constant(X)
-    y = df['always_wrong']
-    
-    # Fit logistic regression with separation handling
-    regularized = False
-    try:
-        model = sm.Logit(y, X).fit(disp=0, maxiter=100)
-        
-        # Check for extreme coefficients (separation indicator)
-        if (np.abs(model.params) > 10).any():
-            print("  WARNING Possible separation detected, using regularized fit...")
-            model = sm.Logit(y, X).fit_regularized(alpha=1.0, disp=0)
-            regularized = True
-            
-    except Exception as e:
-        print(f"  WARNING Standard fit failed ({e}), using regularized fit...")
-        try:
-            model = sm.Logit(y, X).fit_regularized(alpha=1.0, disp=0)
-            regularized = True
-        except Exception as e2:
-            print(f"  ERROR Regularized fit also failed: {e2}")
-            continue
-    
-    print(f"\n  Model: AlwaysWrong ~ Refused + Law + Evidence + Trial + Has{keyword.title()} + RefusedxHas{keyword.title()}")
-    
-    if regularized:
-        print(f"\n  {'Variable':<25} {'Coef':<10} {'Odds Ratio':<12}")
-        print(f"  {'-'*47}")
-        for var in model.params.index:
-            coef = model.params[var]
-            odds = np.exp(coef)
-            print(f"  {var:<25} {coef:<10.3f} {odds:<12.2f}")
-        print("\n  Note: SE/p-values unavailable for regularized fit")
-    else:
-        print(f"\n  {'Variable':<25} {'Coef':<10} {'SE':<10} {'z':<10} {'p-value':<10} {'Odds Ratio':<12}")
-        print(f"  {'-'*77}")
-        
-        for var in model.params.index:
-            coef = model.params[var]
-            se = model.bse[var]
-            z = model.tvalues[var]
-            p = model.pvalues[var]
-            odds = np.exp(coef)
-            
-            sig = "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else ""
-            print(f"  {var:<25} {coef:<10.3f} {se:<10.3f} {z:<10.2f} {p:<10.4f} {odds:<12.2f} {sig}")
-        
-        # Check interaction significance
-        interaction_p = model.pvalues['interaction']
-        if interaction_p < 0.05:
-            print(f"\n  OK INTERACTION SIGNIFICANT (p={interaction_p:.4f}) after controlling for stratum")
+def check(name, expected, actual, atol=None, rtol=0.02):
+    global passes, fails
+    if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
+        ok = abs(expected - actual) <= (atol if atol else rtol * max(abs(expected), 1))
+        if ok:
+            log(f"  PASS: {name} = {actual} (expected {expected})")
+            passes += 1
         else:
-            print(f"\n  WARNING Interaction not significant (p={interaction_p:.4f}) after controlling for stratum")
+            log(f"  FAIL: {name} = {actual} (expected {expected})")
+            fails += 1
+    else:
+        if expected == actual:
+            log(f"  PASS: {name} = {actual}")
+            passes += 1
+        else:
+            log(f"  FAIL: {name} = {actual} (expected {expected})")
+            fails += 1
 
-# =============================================================================
-# 3. WILSON CONFIDENCE INTERVALS
-# =============================================================================
+def warn(m):
+    global warns
+    log(f"  WARNING: {m}")
+    warns += 1
 
-print("\n" + "="*70)
-print("3. WILSON CONFIDENCE INTERVALS FOR KEY ERROR RATES")
-print("="*70)
+def info(m):
+    log(f"  INFO: {m}")
 
-def wilson_ci(events, total, alpha=0.05):
-    """Compute Wilson score confidence interval."""
-    if total == 0:
-        return 0, 0, 0
-    proportion = events / total
-    ci_low, ci_high = proportion_confint(events, total, alpha=alpha, method='wilson')
-    return proportion, ci_low, ci_high
+log("=" * 80)
+log("PAPER VERIFICATION (with label consistency check)")
+log("=" * 80)
 
-print(f"\n  {'Group':<40} {'n':<8} {'Err%':<12} {'95% CI':<20}")
-print(f"  {'-'*80}")
+# Load data files
+try:
+    preds = pd.read_csv(PREDICTIONS)
+    log(f"Loaded preds: {len(preds)}")
+except:
+    preds = None
+    log("ERROR: no preds")
 
-# Key rates to report
-groups = [
-    ("Overall", df['always_wrong'].sum(), len(df)),
-    ("GRANTED cases", df[df['refused']==0]['always_wrong'].sum(), len(df[df['refused']==0])),
-    ("REFUSED cases", df[df['refused']==1]['always_wrong'].sum(), len(df[df['refused']==1])),
-    ("Binding cases (all)", df[df['has_binding']==1]['always_wrong'].sum(), len(df[df['has_binding']==1])),
-    ("Binding + REFUSED", df[(df['has_binding']==1) & (df['refused']==1)]['always_wrong'].sum(), 
-     len(df[(df['has_binding']==1) & (df['refused']==1)])),
-    ("Binding + GRANTED", df[(df['has_binding']==1) & (df['refused']==0)]['always_wrong'].sum(),
-     len(df[(df['has_binding']==1) & (df['refused']==0)])),
-    ("Defamatory cases (all)", df[df['has_defamatory']==1]['always_wrong'].sum(), len(df[df['has_defamatory']==1])),
-    ("Defamatory + REFUSED", df[(df['has_defamatory']==1) & (df['refused']==1)]['always_wrong'].sum(),
-     len(df[(df['has_defamatory']==1) & (df['refused']==1)])),
-]
+try:
+    cons = pd.read_csv(CONSISTENCY)
+    log(f"Loaded cons: {len(cons)}")
+except:
+    cons = None
+    log("ERROR: no cons")
 
-for name, wrong, total in groups:
-    prop, ci_low, ci_high = wilson_ci(wrong, total)
-    print(f"  {name:<40} {total:<8} {prop*100:<12.1f} [{ci_low*100:.1f}%-{ci_high*100:.1f}%]")
+df_text = None
+for f in [ORIGINAL, "sj_231025_w_topics_all_cases.pkl"]:
+    try:
+        df_text = pd.read_pickle(f)
+        log(f"Loaded pickle: {f}")
+        break
+    except:
+        pass
 
-# =============================================================================
-# TIER 2: ENHANCEMENTS
-# =============================================================================
+try:
+    attn = pd.read_csv(ATTENTION)
+    log(f"Loaded attn: {len(attn)}")
+except:
+    attn = None
 
-print("\n" + "="*70)
-print("TIER 2: CALIBRATION ANALYSIS")
-print("="*70)
+try:
+    abl = pd.read_csv(ABLATION)
+    log(f"Loaded abl: {len(abl)}")
+except:
+    abl = None
 
-# Load predictions with probabilities
-all_preds = pd.read_csv('legalbert_multiseed_attention/all_predictions.csv')
+# BUILD CANONICAL LABELS FROM PICKLE
+log("\n" + "=" * 80)
+log("LABEL CONSISTENCY CHECK")
+log("=" * 80)
 
-# Sanity check labels
-assert set(all_preds['label'].unique()) <= {0, 1}, "Unexpected labels!"
-print(f"\n  Sanity check:")
-print(f"    Mean prob_granted for label=0 (granted): {all_preds[all_preds['label']==0]['prob_granted'].mean():.3f}")
-print(f"    Mean prob_granted for label=1 (refused): {all_preds[all_preds['label']==1]['prob_granted'].mean():.3f}")
-
-print("\n4. EXPECTED CALIBRATION ERROR (ECE) - Predicted-Class Confidence")
-print("-"*50)
-
-def compute_ece(confidence, correct, n_bins=10):
-    """
-    Compute Expected Calibration Error using predicted-class confidence.
+df = None
+if df_text is not None:
+    outcomes = ["summary judgment granted", "summary judgment refused"]
+    df = df_text[df_text["outcome"].isin(outcomes)].copy().reset_index(drop=True)
+    df['case_id'] = range(len(df))
+    df['label'] = df['outcome'].map({"summary judgment granted": 0, "summary judgment refused": 1})
+    log(f"Built canonical labels from pickle: {len(df)} cases")
     
-    Args:
-        confidence: probability assigned to the predicted class
-        correct: 1 if prediction was correct, 0 otherwise
-    """
-    bin_boundaries = np.linspace(0, 1, n_bins + 1)
-    ece = 0.0
+    if cons is not None:
+        merged = df[['case_id', 'label']].merge(
+            cons[['case_id', 'label']], on='case_id', suffixes=('_pkl', '_cons'))
+        mismatch = (merged['label_pkl'] != merged['label_cons']).sum()
+        if mismatch > 0:
+            log(f"  ERROR: {mismatch} mismatches pickle vs cons!")
+        else:
+            log("  PASS: pickle == case_consistency.csv")
     
-    for bin_lower, bin_upper in zip(bin_boundaries[:-1], bin_boundaries[1:]):
-        in_bin = (confidence >= bin_lower) & (confidence < bin_upper)
-        if in_bin.any():
-            avg_confidence = confidence[in_bin].mean()
-            avg_accuracy = correct[in_bin].mean()
-            prop_in_bin = in_bin.mean()
-            ece += np.abs(avg_accuracy - avg_confidence) * prop_in_bin
+    if preds is not None:
+        preds_labels = preds.groupby('case_id')['label'].first().reset_index()
+        merged2 = df[['case_id', 'label']].merge(
+            preds_labels, on='case_id', suffixes=('_pkl', '_preds'))
+        mismatch2 = (merged2['label_pkl'] != merged2['label_preds']).sum()
+        if mismatch2 > 0:
+            log(f"  ERROR: {mismatch2} mismatches pickle vs preds!")
+        else:
+            log("  PASS: pickle == all_predictions.csv")
     
-    return ece
+    if cons is not None:
+        df = df.merge(cons[['case_id', 'times_correct', 'stratum']], on='case_id', how='left')
+else:
+    df = cons.copy() if cons is not None else None
 
-# Merge predictions with keyword info
-n_preds_before = len(all_preds)
-preds_with_info = all_preds.merge(df[['case_id', 'has_binding', 'has_defamatory', 'refused']], on='case_id', how='left')
-assert len(preds_with_info) == n_preds_before, f"Merge lost predictions! {n_preds_before} --> {len(preds_with_info)}"
-assert preds_with_info['has_binding'].notna().all(), "Missing keyword info after merge!"
+# DATASET
+log("\n" + "=" * 80 + "\nDATASET")
+if df is not None:
+    check("Total", 1961, len(df))
+    check("Granted", 1196, (df['label'] == 0).sum())
+    check("Refused", 765, (df['label'] == 1).sum())
 
-# Compute predicted-class confidence and correctness
-probs = preds_with_info[['prob_granted', 'prob_refused']].values
-pred = preds_with_info['predicted'].values.astype(int)
-conf = probs[np.arange(len(probs)), pred]  # Probability of predicted class
-correct = (preds_with_info['label'].values.astype(int) == pred).astype(int)
+# OVERALL PERFORMANCE
+log("\n" + "=" * 80 + "\nOVERALL PERFORMANCE")
+if preds is not None:
+    seeds = preds['seed'].unique()
+    accs, f1ms, f1gs, f1rs = [], [], [], []
+    for s in seeds:
+        d = preds[preds['seed'] == s]
+        accs.append(accuracy_score(d['label'], d['predicted']))
+        f1ms.append(f1_score(d['label'], d['predicted'], average='macro'))
+        f1gs.append(f1_score(d['label'], d['predicted'], pos_label=0))
+        f1rs.append(f1_score(d['label'], d['predicted'], pos_label=1))
+    check("Accuracy", 0.627, round(np.mean(accs), 3), atol=0.01)
+    check("F1-Macro", 0.598, round(np.mean(f1ms), 3), atol=0.01)
+    check("F1-Granted", 0.724, round(np.mean(f1gs), 3), atol=0.01)
+    check("F1-Refused", 0.472, round(np.mean(f1rs), 3), atol=0.01)
 
-# Overall ECE
-overall_ece = compute_ece(conf, correct)
-print(f"\n  Overall ECE: {overall_ece:.4f}")
+# TABLE 1
+log("\n" + "=" * 80 + "\nTABLE 1: CONSISTENCY")
+if df is not None and 'times_correct' in df.columns:
+    exp = {0: 153, 1: 254, 2: 280, 3: 310, 4: 418, 5: 546}
+    act = df['times_correct'].value_counts()
+    for s, e in exp.items():
+        check(f"Score {s}/5", e, act.get(s, 0))
 
-# ECE by subgroup (using same confidence/correct for consistency)
-preds_with_info['confidence'] = conf
-preds_with_info['correct'] = correct
+# TABLE 2
+log("\n" + "=" * 80 + "\nTABLE 2: OUTCOME ASYMMETRY")
+if df is not None and 'times_correct' in df.columns:
+    g = df[df['label'] == 0]
+    r = df[df['label'] == 1]
+    g_aw = (g['times_correct'] == 0).sum()
+    r_aw = (r['times_correct'] == 0).sum()
+    check("Granted AW", 43, g_aw)
+    check("Refused AW", 110, r_aw)
+    check("Granted %", 3.6, round(g_aw / len(g) * 100, 1), atol=0.2)
+    check("Refused %", 14.4, round(r_aw / len(r) * 100, 1), atol=0.2)
+    cont = [[g_aw, len(g) - g_aw], [r_aw, len(r) - r_aw]]
+    chi2, p, _, _ = stats.chi2_contingency(cont)
+    check("Chi-sq", 73.2, round(chi2, 1), atol=1.0)
 
-subgroups = [
-    ("GRANTED cases", preds_with_info['label'] == 0),
-    ("REFUSED cases", preds_with_info['label'] == 1),
-    ("Binding cases", preds_with_info['has_binding'] == 1),
-    ("Binding + REFUSED", (preds_with_info['has_binding'] == 1) & (preds_with_info['label'] == 1)),
-    ("Non-binding cases", preds_with_info['has_binding'] == 0),
-]
+# TABLE 3
+log("\n" + "=" * 80 + "\nTABLE 3: ERROR DIRECTION")
+if df is not None and 'times_correct' in df.columns:
+    aw = df[df['times_correct'] == 0]
+    fp = (aw['label'] == 1).sum()
+    fn = (aw['label'] == 0).sum()
+    check("Total AW", 153, len(aw))
+    check("FP", 110, fp)
+    check("FN", 43, fn)
 
-print(f"\n  {'Subgroup':<30} {'N':<10} {'ECE':<10}")
-print(f"  {'-'*50}")
+# TABLE 4 N CHECK
+log("\n" + "=" * 80 + "\nTABLE 4: L/E/T N CHECK")
+if df is not None and 'stratum' in df.columns:
+    t4 = {'EVIDENCE + TRIAL': 188, 'LAW + EVIDENCE': 444, 'ALL THREE': 163}
+    for st, en in t4.items():
+        an = len(df[df['stratum'] == st])
+        if en != an:
+            warn(f"{st}: paper={en} actual={an}")
 
-for name, mask in subgroups:
-    subset = preds_with_info[mask]
-    if len(subset) > 0:
-        ece = compute_ece(subset['confidence'].values, subset['correct'].values)
-        print(f"  {name:<30} {len(subset):<10} {ece:.4f}")
+# SECTION 4 PERFORMANCE
+log("\n" + "=" * 80 + "\nSECTION 4: L/E/T PERFORMANCE")
+if preds is not None and df is not None and 'stratum' in df.columns:
+    ps = preds.merge(df[['case_id', 'stratum']], on='case_id')
+    s4 = {
+        'ALL THREE': {'n': 161, 'acc': 0.706, 'f1g': 0.799, 'f1r': 0.447},
+        'LAW + EVIDENCE': {'n': 559, 'acc': 0.678, 'f1g': 0.780, 'f1r': 0.399},
+        'LAW + TRIAL': {'n': 112, 'acc': 0.641, 'f1g': 0.712, 'f1r': 0.523},
+        'TRIAL only': {'n': 120, 'acc': 0.655, 'f1g': 0.708, 'f1r': 0.579},
+        'EVIDENCE only': {'n': 317, 'acc': 0.605, 'f1g': 0.642, 'f1r': 0.559},
+        'LAW only': {'n': 487, 'acc': 0.579, 'f1g': 0.625, 'f1r': 0.519},
+        'EVIDENCE + TRIAL': {'n': 187, 'acc': 0.541, 'f1g': 0.528, 'f1r': 0.552},
+    }
+    seeds = ps['seed'].unique()
+    for st, ex in s4.items():
+        accs, f1gs, f1rs = [], [], []
+        for sd in seeds:
+            d = ps[(ps['seed'] == sd) & (ps['stratum'] == st)]
+            if len(d) > 0 and len(d['label'].unique()) > 1:
+                accs.append(accuracy_score(d['label'], d['predicted']))
+                f1gs.append(f1_score(d['label'], d['predicted'], pos_label=0))
+                f1rs.append(f1_score(d['label'], d['predicted'], pos_label=1))
+        check(f"{st} N", ex['n'], len(df[df['stratum'] == st]))
+        if accs:
+            check(f"{st} acc", ex['acc'], round(np.mean(accs), 3), atol=0.01)
+            check(f"{st} F1g", ex['f1g'], round(np.mean(f1gs), 3), atol=0.01)
+            check(f"{st} F1r", ex['f1r'], round(np.mean(f1rs), 3), atol=0.01)
 
-# =============================================================================
-# 5. PER-FOLD DISTRIBUTION CHECK
-# =============================================================================
+# TABLE 5 ATTENTION
+log("\n" + "=" * 80 + "\nTABLE 5: ATTENTION")
+if attn is not None:
+    aw_a = attn[attn['times_correct'] == 0]
+    ar_a = attn[attn['times_correct'] == 5]
+    check("AW FACTS", 0.0047, round(aw_a['raw_density_FACTS'].mean(), 4), atol=0.001)
+    check("AW APP", 0.0047, round(aw_a['raw_density_APPLICANT'].mean(), 4), atol=0.001)
+    check("AW DEF", 0.0056, round(aw_a['raw_density_DEFENCE'].mean(), 4), atol=0.001)
+    check("AR FACTS", 0.0049, round(ar_a['raw_density_FACTS'].mean(), 4), atol=0.001)
+    check("AR APP", 0.0049, round(ar_a['raw_density_APPLICANT'].mean(), 4), atol=0.001)
+    check("AR DEF", 0.0059, round(ar_a['raw_density_DEFENCE'].mean(), 4), atol=0.001)
 
-print("\n" + "="*70)
-print("5. PER-FOLD DISTRIBUTION: Binding + REFUSED Cases")
-print("="*70)
+# TABLE 6 ABLATION
+log("\n" + "=" * 80 + "\nTABLE 6: ABLATION")
+if abl is not None:
+    aw_ab = abl[abl['times_correct'] == 0]
+    ar_ab = abl[abl['times_correct'] == 5]
+    check("AW FACTS d", 0.158, round(aw_ab['facts_delta'].mean(), 3), atol=0.02)
+    check("AW APP d", 0.115, round(aw_ab['applicant_delta'].mean(), 3), atol=0.02)
+    check("AW DEF d", 0.025, round(aw_ab['defence_delta'].mean(), 3), atol=0.02)
+    check("AR FACTS d", 0.164, round(ar_ab['facts_delta'].mean(), 3), atol=0.02)
+    check("AR APP d", 0.085, round(ar_ab['applicant_delta'].mean(), 3), atol=0.02)
+    check("AR DEF d", -0.020, round(ar_ab['defence_delta'].mean(), 3), atol=0.02)
 
-print("\n  Checking if binding-refused cases are underrepresented in training folds...")
+# TABLE 7
+log("\n" + "=" * 80 + "\nTABLE 7: ABLATION BY ERROR")
+if abl is not None:
+    aw_ab = abl[abl['times_correct'] == 0]
+    fp_ab = aw_ab[aw_ab['label'] == 1]
+    fn_ab = aw_ab[aw_ab['label'] == 0]
+    info(f"FP N: {len(fp_ab)} (paper:29), FN N: {len(fn_ab)} (paper:11)")
+    info(f"FP DEF: {fp_ab['defence_delta'].mean():.3f} (paper:+0.129)")
+    info(f"FN DEF: {fn_ab['defence_delta'].mean():.3f} (paper:-0.249)")
+    if len(fp_ab) != 29 or len(fn_ab) != 11:
+        warn("Table 7 N mismatch - paper used subset")
 
-# Get fold assignments
-fold_dist = all_preds.merge(df[['case_id', 'has_binding', 'refused']], on='case_id', how='left')
-assert len(fold_dist) == len(all_preds), "Merge lost predictions!"
-binding_refused = fold_dist[(fold_dist['has_binding']==1) & (fold_dist['refused']==1)]
+# VOCABULARY
+log("\n" + "=" * 80 + "\nVOCABULARY & KEYWORDS")
+if df is not None and 'times_correct' in df.columns and 'defence_reason' in df.columns:
+    aw_df = df[df['times_correct'] == 0]
+    ar_df = df[df['times_correct'] == 5]
+    n_aw, n_ar = len(aw_df), len(ar_df)
+    
+    def ext(t):
+        return set(re.findall(r'\b[a-z]{4,}\b', str(t).lower())) if pd.notna(t) else set()
+    
+    aw_def = aw_df['defence_reason'].apply(ext)
+    ar_def = ar_df['defence_reason'].apply(ext)
+    t8 = {'defamatory': (6.5, 1.1), 'binding': (5.9, 1.3), 'property': (5.9, 1.8)}
+    for w, (ew, er) in t8.items():
+        wp = sum(1 for ws in aw_def if w in ws) / n_aw * 100
+        rp = sum(1 for ws in ar_def if w in ws) / n_ar * 100
+        check(f"'{w}' W%", ew, round(wp, 1), atol=0.5)
+        check(f"'{w}' R%", er, round(rp, 1), atol=0.5)
+    
+    df['comb'] = (df['facts'].fillna('') + ' ' + df['applicant_reason'].fillna('') + ' ' + df['defence_reason'].fillna('')).str.lower()
+    t10 = {'binding': (73, 16.4, 7.5), 'defamatory': (52, 15.4, 7.6), 'settlement': (90, 13.3, 7.5)}
+    for kw, (en, ew, ewo) in t10.items():
+        has = df['comb'].str.contains(kw, na=False)
+        wk = df[has]
+        wok = df[~has]
+        errw = (wk['times_correct'] == 0).sum() / len(wk) * 100 if len(wk) > 0 else 0
+        errwo = (wok['times_correct'] == 0).sum() / len(wok) * 100 if len(wok) > 0 else 0
+        check(f"'{kw}' N", en, len(wk))
+        check(f"'{kw}' w%", ew, round(errw, 1), atol=1.0)
+        check(f"'{kw}' wo%", ewo, round(errwo, 1), atol=1.0)
+    
+    t11 = {'binding': (4.8, 32.3), 'defamatory': (6.5, 28.6), 'property': (3.3, 17.8)}
+    for kw, (eg, er) in t11.items():
+        has = df['comb'].str.contains(kw, na=False)
+        wk = df[has]
+        gk = wk[wk['label'] == 0]
+        rk = wk[wk['label'] == 1]
+        ge = (gk['times_correct'] == 0).sum() / len(gk) * 100 if len(gk) > 0 else 0
+        re = (rk['times_correct'] == 0).sum() / len(rk) * 100 if len(rk) > 0 else 0
+        check(f"'{kw}' G%", eg, round(ge, 1), atol=1.0)
+        check(f"'{kw}' R%", er, round(re, 1), atol=1.0)
+    
+    b = df[df['comb'].str.contains('binding', na=False)]
+    check("Binding N", 73, len(b))
+    check("Binding G", 42, (b['label'] == 0).sum())
+    check("Binding R", 31, (b['label'] == 1).sum())
+    check("Binding G AW", 2, ((b['label'] == 0) & (b['times_correct'] == 0)).sum())
+    check("Binding R AW", 10, ((b['label'] == 1) & (b['times_correct'] == 0)).sum())
+    
+    try:
+        vec = CountVectorizer(ngram_range=(1, 3), min_df=5, max_df=0.95, stop_words='english')
+        vec.fit(df['comb'].fillna('').tolist())
+        check("Phrases", 5392, len(vec.get_feature_names_out()), atol=100)
+    except:
+        pass
 
-print(f"\n  Total binding+refused cases: {len(df[(df['has_binding']==1) & (df['refused']==1)])}")
-print(f"\n  {'Seed':<8} {'Fold':<8} {'In Validation':<15}")
-print(f"  {'-'*31}")
-
-# For each seed/fold, count binding+refused in validation
-for seed in sorted(all_preds['seed'].unique()):
-    for fold in sorted(all_preds['fold'].unique()):
-        subset = binding_refused[(binding_refused['seed']==seed) & (binding_refused['fold']==fold)]
-        in_val = len(subset)
-        print(f"  {seed:<8} {fold:<8} {in_val:<15}")
-
-# Summary statistics - ensure all 25 combos are counted
-all_pairs = pd.MultiIndex.from_product(
-    [sorted(all_preds['seed'].unique()), sorted(all_preds['fold'].unique())],
-    names=['seed', 'fold']
-)
-counts = binding_refused.groupby(['seed', 'fold']).size().reindex(all_pairs, fill_value=0)
-
-print(f"\n  Mean per fold: {counts.mean():.1f} binding+refused cases in validation")
-print(f"  Std dev: {counts.std():.2f}")
-print(f"  Min: {counts.min()}, Max: {counts.max()}")
-
-# =============================================================================
-# 6. ADDITIONAL: OVERCONFIDENCE ANALYSIS
-# =============================================================================
-
-print("\n" + "="*70)
-print("6. OVERCONFIDENCE ANALYSIS: Are Wrong Predictions Confident?")
-print("="*70)
-
-# For always-wrong cases, what was the average confidence?
-aw_cases = df[df['always_wrong']==1]['case_id'].tolist()
-aw_preds = all_preds[all_preds['case_id'].isin(aw_cases)]
-
-print(f"\n  Always-Wrong Cases (n={len(aw_cases)} cases, {len(aw_preds)} predictions):")
-
-# For each prediction, confidence = max(prob_granted, prob_refused)
-aw_preds = aw_preds.copy()
-aw_preds['confidence'] = aw_preds[['prob_granted', 'prob_refused']].max(axis=1)
-aw_preds['pred_granted'] = (aw_preds['predicted'] == 0).astype(int)
-
-print(f"  Mean confidence in wrong predictions: {aw_preds['confidence'].mean():.3f}")
-print(f"  Median confidence: {aw_preds['confidence'].median():.3f}")
-
-# Compare to always-right
-ar_cases = df[df['times_correct']==5]['case_id'].tolist()
-ar_preds = all_preds[all_preds['case_id'].isin(ar_cases)]
-ar_preds = ar_preds.copy()
-ar_preds['confidence'] = ar_preds[['prob_granted', 'prob_refused']].max(axis=1)
-
-print(f"\n  Always-Right Cases (n={len(ar_cases)} cases, {len(ar_preds)} predictions):")
-print(f"  Mean confidence in correct predictions: {ar_preds['confidence'].mean():.3f}")
-print(f"  Median confidence: {ar_preds['confidence'].median():.3f}")
-
-# Binding + Refused wrong cases
-br_aw = df[(df['has_binding']==1) & (df['refused']==1) & (df['always_wrong']==1)]['case_id'].tolist()
-if len(br_aw) > 0:
-    br_preds = all_preds[all_preds['case_id'].isin(br_aw)]
-    br_preds = br_preds.copy()
-    br_preds['confidence'] = br_preds[['prob_granted', 'prob_refused']].max(axis=1)
-    print(f"\n  Binding + REFUSED + Always-Wrong (n={len(br_aw)} cases):")
-    print(f"  Mean confidence: {br_preds['confidence'].mean():.3f}")
-
-# =============================================================================
 # SUMMARY
-# =============================================================================
+log("\n" + "=" * 80 + "\nINCONSISTENCY")
+warn("Table 4 N values differ from Section 4 - update paper")
 
-print("\n" + "="*70)
-print("SUMMARY: KEY STATISTICAL FINDINGS")
-print("="*70)
+log("\n" + "=" * 80 + "\nSUMMARY")
+log(f"PASSED: {passes}")
+log(f"FAILED: {fails}")
+log(f"WARNINGS: {warns}")
 
-print("""
-1. CHI-SQUARE TESTS:
-   - Binding x AlwaysWrong: Check p-value above
-   - Defamatory x AlwaysWrong: Check p-value above
-
-2. LOGISTIC REGRESSION:
-   - Interaction term (Refused x Binding) significance confirms
-     directional domain-conditioned bias
-
-3. WILSON CONFIDENCE INTERVALS:
-   - Binding + REFUSED: 32.3% [CI: see above]
-   - Wide CI reflects small n - acknowledge in paper
-
-4. CALIBRATION:
-   - ECE by subgroup shows if binding cases are miscalibrated
-
-5. FOLD DISTRIBUTION:
-   - If binding+refused evenly distributed --> not a sampling artifact
-
-6. OVERCONFIDENCE:
-   - If wrong predictions are confident --> miscalibration confirmed
-""")
+with open("verification_report.txt", "w") as f:
+    f.write("\n".join(report))
+log("Saved: verification_report.txt")

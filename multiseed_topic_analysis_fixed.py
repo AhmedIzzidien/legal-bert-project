@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
 """
 ===============================================================================
-MULTI-SEED TOPIC ANALYSIS (FINAL)
+MULTI-SEED TOPIC ANALYSIS (FIXED)
 ===============================================================================
 
 Merges multi-seed consistency results with topic labels to produce
 ROBUST topic difficulty rankings based on 5-seed × 5-fold evaluation.
 
-KEY: The consistency.csv has case_id 0-1960 which corresponds to the
-FILTERED binary cases, not the original 2466-row pkl. We must filter
-the pkl the same way, then merge on case_id.
-
 Inputs:
-    - case_consistency.csv (from multi-seed run) - 1961 binary cases
-    - sj_231025_w_topics_all_cases.pkl (all 2466 cases with topics)
+    - case_consistency.csv (from multi-seed run) - has 'times_correct' column
+    - sj_231025_w_topics_all_cases.pkl (with topic labels)
 
 Outputs:
     - Topic error rates based on multi-seed consistency
@@ -38,8 +34,12 @@ CONSISTENCY_FILE = "legalbert_multiseed_attention/case_consistency.csv"
 TOPICS_FILE = "sj_231025_w_topics_all_cases.pkl"
 OUTPUT_DIR = "multiseed_topic_analysis"
 
+# Expected counts (sanity check)
+EXPECTED_ALWAYS_WRONG = 153
+EXPECTED_ALWAYS_RIGHT = 546
+
 # ===============================================================================
-# LOAD DATA
+# LOAD AND MERGE DATA
 # ===============================================================================
 
 print("="*70)
@@ -50,68 +50,30 @@ print("="*70)
 print(f"\n📂 Loading: {CONSISTENCY_FILE}")
 df_consistency = pd.read_csv(CONSISTENCY_FILE)
 print(f"   Rows: {len(df_consistency)}")
-print(f"   case_id range: {df_consistency['case_id'].min()} to {df_consistency['case_id'].max()}")
+print(f"   Columns: {list(df_consistency.columns)}")
 
 # Verify times_correct column exists
 if 'times_correct' not in df_consistency.columns:
     print(f"\n❌ ERROR: 'times_correct' column not found!")
     exit(1)
 
-# Load topics data (all cases)
+# Load topics data
 print(f"\n📂 Loading: {TOPICS_FILE}")
-df_topics_full = pd.read_pickle(TOPICS_FILE)
-print(f"   Rows (all cases): {len(df_topics_full)}")
+df_topics = pd.read_pickle(TOPICS_FILE)
+print(f"   Rows: {len(df_topics)}")
 
-# ===============================================================================
-# FILTER TOPICS TO BINARY CASES (same as multi-seed did)
-# ===============================================================================
-
-print("\n" + "="*70)
-print("📊 ALIGNING DATASETS")
-print("="*70)
-
-print(f"\n   Raw outcome distribution in pkl:")
-print(df_topics_full['outcome'].value_counts())
-
-# Normalize outcomes (same logic multi-seed used)
-def normalize_outcome(outcome):
-    if pd.isna(outcome):
-        return None
-    outcome = str(outcome).lower().strip()
-    if 'granted' in outcome and 'refused' not in outcome and 'partly' not in outcome:
-        return 'GRANTED'
-    elif 'refused' in outcome:
-        return 'REFUSED'
-    else:
-        return None
-
-df_topics_full['outcome_binary'] = df_topics_full['outcome'].apply(normalize_outcome)
-
-# Filter to binary cases
-df_topics = df_topics_full[df_topics_full['outcome_binary'].isin(['GRANTED', 'REFUSED'])].copy()
-df_topics = df_topics.reset_index(drop=True)  # Reset index to get 0-1960
-df_topics['case_id'] = df_topics.index  # case_id = new sequential index
-
-print(f"\n   Binary cases in pkl: {len(df_topics)}")
-print(f"   Binary cases in consistency.csv: {len(df_consistency)}")
-
-# Verify counts match
-if len(df_topics) != len(df_consistency):
-    print(f"\n⚠️  WARNING: Counts don't match exactly!")
-    print(f"   pkl binary: {len(df_topics)}, consistency: {len(df_consistency)}")
-    print(f"   Proceeding with merge on case_id...")
-
-# ===============================================================================
-# MERGE ON case_id
-# ===============================================================================
-
-print(f"\n🔗 Merging on case_id...")
-df = df_consistency.merge(df_topics, on='case_id', how='inner')
-print(f"   Merged rows: {len(df)}")
-
-if len(df) < len(df_consistency) * 0.95:
-    print(f"\n❌ ERROR: Too many rows lost in merge! Check alignment.")
+# Check alignment
+if len(df_consistency) != len(df_topics):
+    print(f"\n❌ ERROR: Row counts don't match!")
     exit(1)
+
+# Merge on index (verified aligned via text match earlier)
+print(f"\n🔗 Merging on index...")
+df = df_consistency.copy()
+df['primary_topic'] = df_topics['primary_topic'].values
+df['secondary_topic'] = df_topics['secondary_topic'].values
+df['outcome'] = df_topics['outcome'].values
+df['decision_reason_categories'] = df_topics['decision_reason_categories'].values
 
 # Parse L/E/T from decision_reason_categories
 def parse_let(cat):
@@ -137,10 +99,41 @@ df['always_wrong'] = df[consistency_col] == 0
 df['always_right'] = df[consistency_col] == 5
 df['structurally_hard'] = df[consistency_col] <= 1  # 0/5 or 1/5
 
-print(f"   ✅ Merged and ready: {len(df)} cases")
+print(f"   ✅ Merged: {len(df)} cases")
 
 # Create output directory
 Path(OUTPUT_DIR).mkdir(exist_ok=True)
+
+# ===============================================================================
+# FILTER TO BINARY CASES
+# ===============================================================================
+
+print("\n" + "="*70)
+print("📊 FILTERING TO BINARY CASES")
+print("="*70)
+
+print(f"\n   Raw outcome distribution:")
+print(df['outcome'].value_counts())
+
+# Normalize outcomes (handle full string format)
+def normalize_outcome(outcome):
+    if pd.isna(outcome):
+        return None
+    outcome = str(outcome).lower().strip()
+    if 'granted' in outcome and 'refused' not in outcome and 'partly' not in outcome:
+        return 'GRANTED'
+    elif 'refused' in outcome:
+        return 'REFUSED'
+    else:
+        return None
+
+df['outcome_binary'] = df['outcome'].apply(normalize_outcome)
+
+# Filter to binary cases
+df_binary = df[df['outcome_binary'].isin(['GRANTED', 'REFUSED'])].copy()
+print(f"\n   Binary cases: {len(df_binary)} / {len(df)}")
+print(f"   GRANTED: {(df_binary['outcome_binary'] == 'GRANTED').sum()}")
+print(f"   REFUSED: {(df_binary['outcome_binary'] == 'REFUSED').sum()}")
 
 # ===============================================================================
 # SANITY CHECK COUNTS
@@ -150,13 +143,21 @@ print("\n" + "="*70)
 print("📊 SANITY CHECK")
 print("="*70)
 
-n_always_wrong = df['always_wrong'].sum()
-n_always_right = df['always_right'].sum()
+n_always_wrong = df_binary['always_wrong'].sum()
+n_always_right = df_binary['always_right'].sum()
 
-print(f"\n   Always-wrong (0/5): {n_always_wrong} cases ({n_always_wrong/len(df)*100:.1f}%)")
-print(f"   Always-right (5/5): {n_always_right} cases ({n_always_right/len(df)*100:.1f}%)")
-print(f"   GRANTED: {(df['outcome_binary'] == 'GRANTED').sum()}")
-print(f"   REFUSED: {(df['outcome_binary'] == 'REFUSED').sum()}")
+print(f"\n   Always-wrong (0/5): {n_always_wrong} cases")
+print(f"   Always-right (5/5): {n_always_right} cases")
+
+if abs(n_always_wrong - EXPECTED_ALWAYS_WRONG) > 5:
+    print(f"   ⚠️  Expected ~{EXPECTED_ALWAYS_WRONG} always-wrong, got {n_always_wrong}")
+else:
+    print(f"   ✅ Always-wrong count matches expected")
+
+if abs(n_always_right - EXPECTED_ALWAYS_RIGHT) > 10:
+    print(f"   ⚠️  Expected ~{EXPECTED_ALWAYS_RIGHT} always-right, got {n_always_right}")
+else:
+    print(f"   ✅ Always-right count matches expected")
 
 # ===============================================================================
 # CONSISTENCY DISTRIBUTION
@@ -167,7 +168,7 @@ print("📊 CONSISTENCY DISTRIBUTION")
 print("="*70)
 
 print(f"\n   Distribution of times_correct (0-5):")
-print(df[consistency_col].value_counts().sort_index())
+print(df_binary[consistency_col].value_counts().sort_index())
 
 # ===============================================================================
 # TOPIC ERROR RATE ANALYSIS (MULTI-SEED)
@@ -219,7 +220,7 @@ def analyze_topic_errors(df, topic_col, min_cases=10):
     return pd.DataFrame(results).sort_values('always_wrong_rate', ascending=False)
 
 # Analyze primary topics
-topic_stats = analyze_topic_errors(df, 'primary_topic', min_cases=20)
+topic_stats = analyze_topic_errors(df_binary, 'primary_topic', min_cases=20)
 
 print(f"\n{'Topic':<45} {'N':>6} {'Always Wrong':>14} {'Hard (0-1/5)':>14} {'Always Right':>14} {'Mean Cons':>10}")
 print("-"*105)
@@ -273,7 +274,7 @@ def analyze_topic_outcome_interaction(df, topic_col, min_cases=10):
     
     return pd.DataFrame(results)
 
-topic_outcome = analyze_topic_outcome_interaction(df, 'primary_topic')
+topic_outcome = analyze_topic_outcome_interaction(df_binary, 'primary_topic')
 
 # Pivot for easy comparison
 if len(topic_outcome) > 0:
@@ -310,8 +311,8 @@ print("📊 L/E/T STRATIFIED ERROR RATES (MULTI-SEED)")
 print("="*70)
 
 let_stats = []
-for strata in df['LET_strata'].unique():
-    strata_df = df[df['LET_strata'] == strata]
+for strata in df_binary['LET_strata'].unique():
+    strata_df = df_binary[df_binary['LET_strata'] == strata]
     n = len(strata_df)
     
     if n < 10:
@@ -350,11 +351,11 @@ print("📊 TOPIC × L/E/T CROSS-ANALYSIS (TOP COMBINATIONS)")
 print("="*70)
 
 cross_stats = []
-for topic in df['primary_topic'].unique():
+for topic in df_binary['primary_topic'].unique():
     if pd.isna(topic):
         continue
-    for strata in df['LET_strata'].unique():
-        subset = df[(df['primary_topic'] == topic) & (df['LET_strata'] == strata)]
+    for strata in df_binary['LET_strata'].unique():
+        subset = df_binary[(df_binary['primary_topic'] == topic) & (df_binary['LET_strata'] == strata)]
         n = len(subset)
         
         if n < 10:
@@ -441,7 +442,7 @@ if len(topic_stats) > 5:
     
     consistency_dist = []
     for topic in top_topics_list:
-        topic_df = df[df['primary_topic'] == topic]
+        topic_df = df_binary[df_binary['primary_topic'] == topic]
         dist = topic_df[consistency_col].value_counts(normalize=True).sort_index()
         consistency_dist.append({
             'topic': topic,
@@ -450,7 +451,7 @@ if len(topic_stats) > 5:
     
     dist_df = pd.DataFrame(consistency_dist).set_index('topic')
     
-    # Use matplotlib for heatmap
+    # Use matplotlib for heatmap instead of seaborn
     im = ax.imshow(dist_df.values, cmap='RdYlGn', aspect='auto')
     
     ax.set_xticks(range(len(dist_df.columns)))
@@ -482,9 +483,9 @@ print("\n" + "="*70)
 print("📊 SUMMARY")
 print("="*70)
 
-print(f"\n   Total binary cases: {len(df)}")
-print(f"   Always wrong (0/5): {df['always_wrong'].sum()} ({df['always_wrong'].mean()*100:.1f}%)")
-print(f"   Always right (5/5): {df['always_right'].sum()} ({df['always_right'].mean()*100:.1f}%)")
+print(f"\n   Total binary cases: {len(df_binary)}")
+print(f"   Always wrong (0/5): {df_binary['always_wrong'].sum()} ({df_binary['always_wrong'].mean()*100:.1f}%)")
+print(f"   Always right (5/5): {df_binary['always_right'].sum()} ({df_binary['always_right'].mean()*100:.1f}%)")
 
 print(f"\n   🏆 HARDEST TOPICS (by always-wrong rate):")
 for _, row in topic_stats.head(5).iterrows():

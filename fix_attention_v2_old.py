@@ -357,61 +357,57 @@ def main():
     del test_model, test_tokenizer
     torch.cuda.empty_cache()
     
+    # Initialize model cache
+    model_cache = ModelCache(device, max_models=5)
+    
     # =========================================================================
-    # EXTRACT ATTENTION - LOOP BY MODEL (not by case) to avoid reloading
+    # EXTRACT ATTENTION USING CORRECT MODEL PER CASE
     # =========================================================================
     
-    print(f"\n🔬 Extracting attention (loading each model ONCE)...")
+    print(f"\n🔬 Extracting attention (using correct model per prediction)...")
     
     results = []
     
-    # Build quick lookup for case data
-    df_by_id = df.set_index('case_id')
+    # Group predictions by case for efficiency
+    case_predictions = all_preds.groupby('case_id')
     
-    # Group predictions by (seed, fold) so each model loads ONCE
-    model_groups = all_preds.groupby(['seed', 'fold'])
-    
-    for (seed, fold), preds_group in tqdm(model_groups, total=len(model_groups), desc="Models"):
-        model_key = (int(seed), int(fold))
-        if model_key not in model_paths:
-            continue
+    for case_id, case_preds in tqdm(case_predictions, total=len(case_predictions), desc="Extracting"):
+        case_row = df[df['case_id'] == case_id].iloc[0]
+        text = format_text(case_row)
         
-        # Load model ONCE for all cases it predicted
-        model = AutoModelForSequenceClassification.from_pretrained(
-            model_paths[model_key],
-            attn_implementation="eager"
-        )
-        tokenizer = AutoTokenizer.from_pretrained(model_paths[model_key])
-        model = model.to(device)
-        model.eval()
-        
-        # Process all cases predicted by this model
-        for _, pred_row in preds_group.iterrows():
-            case_id = int(pred_row['case_id'])
-            case_row = df_by_id.loc[case_id]
+        # For each prediction of this case (one per seed)
+        for _, pred_row in case_preds.iterrows():
+            seed = pred_row['seed']
+            fold = pred_row['fold']
             
-            text = format_text(case_row)
+            model_key = (seed, fold)
+            if model_key not in model_paths:
+                continue
             
+            # Get the correct model
+            model, tokenizer = model_cache.get(model_paths[model_key])
+            
+            # Extract attention
             attn_info = extract_attention(model, tokenizer, text, device)
             metrics = compute_section_metrics(
-                attn_info['tokens'],
+                attn_info['tokens'], 
                 attn_info['cls_attention_mean'],
                 attn_info['cls_attention_max']
             )
             
             results.append({
                 'case_id': case_id,
-                'seed': int(seed),
-                'fold': int(fold),
-                'label': int(case_row['label']),
-                'times_correct': case_row.get('times_correct', None),
-                'stratum': case_row.get('stratum', None),
+                'seed': seed,
+                'fold': fold,
+                'label': case_row['label'],
+                'times_correct': case_row['times_correct'],
+                'stratum': case_row['stratum'],
                 'correct': pred_row.get('correct', None),
-                # RAW DENSITY (mean-based)
+                # RAW DENSITY (mean-based) - THE MEANINGFUL METRIC
                 'raw_density_FACTS': metrics['raw_density_mean']['FACTS'],
                 'raw_density_APPLICANT': metrics['raw_density_mean']['APPLICANT'],
                 'raw_density_DEFENCE': metrics['raw_density_mean']['DEFENCE'],
-                # RAW DENSITY (max-based)
+                # RAW DENSITY (max-based) - may reveal selective heads
                 'raw_density_max_FACTS': metrics['raw_density_max']['FACTS'],
                 'raw_density_max_APPLICANT': metrics['raw_density_max']['APPLICANT'],
                 'raw_density_max_DEFENCE': metrics['raw_density_max']['DEFENCE'],
@@ -424,10 +420,8 @@ def main():
                 'tokens_APPLICANT': metrics['token_counts']['APPLICANT'],
                 'tokens_DEFENCE': metrics['token_counts']['DEFENCE'],
             })
-        
-        # Free model after processing all its cases
-        del model, tokenizer
-        torch.cuda.empty_cache()
+    
+    model_cache.clear()
     
     results_df = pd.DataFrame(results)
     results_df.to_csv(OUTPUT_DIR / "attention_per_prediction.csv", index=False)
@@ -511,7 +505,7 @@ def main():
               f"{subset['raw_density_max_DEFENCE'].mean():.4f}")
     
     # =========================================================================
-    # ABLATION STUDY - LOOP BY MODEL (not by case)
+    # ABLATION STUDY (using correct models per prediction)
     # =========================================================================
     
     print(f"\n{'='*70}")
@@ -519,43 +513,43 @@ def main():
     print(f"{'='*70}")
     
     # Sample cases stratified by consistency
-    sample_ids = set()
+    sample_ids = []
     for tc in [0, 1, 2, 3, 4, 5]:
         tc_cases = case_summary[case_summary['times_correct'] == tc]['case_id'].tolist()
-        sample_ids.update(tc_cases[:min(40, len(tc_cases))])
+        sample_ids.extend(tc_cases[:min(40, len(tc_cases))])  # Up to 40 per group
     
     print(f"\n   Running ablation on {len(sample_ids)} sampled cases...")
-    print(f"   Loading each model ONCE (25 models total)")
+    print(f"   Using CORRECT model per prediction (aligned with CV results)")
     
-    # Get predictions for sampled cases only
+    # Reinitialize model cache for ablation
+    ablation_cache = ModelCache(device, max_models=5)
+    
+    ablation_results = []
+    
+    # Get predictions for sampled cases
     sample_preds = all_preds[all_preds['case_id'].isin(sample_ids)]
     
-    # Store per-case, per-model results
-    ablation_raw = []
-    
-    # Group by model
-    ablation_groups = sample_preds.groupby(['seed', 'fold'])
-    
-    for (seed, fold), preds_group in tqdm(ablation_groups, total=len(ablation_groups), desc="Ablation"):
-        model_key = (int(seed), int(fold))
-        if model_key not in model_paths:
-            continue
+    for case_id in tqdm(sample_ids, desc="Ablation"):
+        case_row = df[df['case_id'] == case_id].iloc[0]
+        text = format_text(case_row)
         
-        # Load model ONCE
-        model = AutoModelForSequenceClassification.from_pretrained(
-            model_paths[model_key],
-            attn_implementation="eager"
-        )
-        tokenizer = AutoTokenizer.from_pretrained(model_paths[model_key])
-        model = model.to(device)
-        model.eval()
+        # Get all predictions for this case
+        case_preds = sample_preds[sample_preds['case_id'] == case_id]
         
-        g_idx, r_idx = get_label_indices(model)
+        # Run ablation using each model that predicted this case
+        case_deltas = {'facts': [], 'applicant': [], 'defence': []}
+        case_flips = {'facts': [], 'applicant': [], 'defence': []}
         
-        for _, pred_row in preds_group.iterrows():
-            case_id = int(pred_row['case_id'])
-            case_row = df_by_id.loc[case_id]
-            text = format_text(case_row)
+        for _, pred_row in case_preds.iterrows():
+            seed = pred_row['seed']
+            fold = pred_row['fold']
+            
+            model_key = (seed, fold)
+            if model_key not in model_paths:
+                continue
+            
+            model, tokenizer = ablation_cache.get(model_paths[model_key])
+            g_idx, r_idx = get_label_indices(model)
             
             # Baseline
             base = get_prediction_probs(model, tokenizer, text, device, g_idx, r_idx)
@@ -565,44 +559,24 @@ def main():
                 masked_text = mask_section(text, section, n_masks=MASK_LENGTH)
                 masked = get_prediction_probs(model, tokenizer, masked_text, device, g_idx, r_idx)
                 
-                ablation_raw.append({
-                    'case_id': case_id,
-                    'seed': int(seed),
-                    'fold': int(fold),
-                    'label': int(case_row['label']),
-                    'times_correct': case_row.get('times_correct', None),
-                    'section': section,
-                    'delta': masked['prob_refused'] - base['prob_refused'],
-                    'flipped': int(masked['pred'] != base['pred']),
-                })
+                case_deltas[section.lower()].append(masked['prob_refused'] - base['prob_refused'])
+                case_flips[section.lower()].append(int(masked['pred'] != base['pred']))
         
-        del model, tokenizer
-        torch.cuda.empty_cache()
-    
-    # Aggregate ablation results per case
-    ablation_raw_df = pd.DataFrame(ablation_raw)
-    
-    # Pivot to get one row per case
-    ablation_results = []
-    for case_id in sample_ids:
-        case_data = ablation_raw_df[ablation_raw_df['case_id'] == case_id]
-        if len(case_data) == 0:
-            continue
-        
-        case_row = df_by_id.loc[case_id]
-        result = {
+        # Average across all models that predicted this case
+        ablation_results.append({
             'case_id': case_id,
-            'label': int(case_row['label']),
-            'times_correct': case_row.get('times_correct', None),
-            'n_models': len(case_data) // 3,  # 3 sections per model
-        }
-        
-        for section in ['FACTS', 'APPLICANT', 'DEFENCE']:
-            section_data = case_data[case_data['section'] == section]
-            result[f'{section.lower()}_delta'] = section_data['delta'].mean()
-            result[f'{section.lower()}_flipped'] = section_data['flipped'].mean()
-        
-        ablation_results.append(result)
+            'label': case_row['label'],
+            'times_correct': case_row['times_correct'],
+            'n_models': len(case_preds),
+            'facts_delta': np.mean(case_deltas['facts']) if case_deltas['facts'] else 0,
+            'applicant_delta': np.mean(case_deltas['applicant']) if case_deltas['applicant'] else 0,
+            'defence_delta': np.mean(case_deltas['defence']) if case_deltas['defence'] else 0,
+            'facts_flipped': np.mean(case_flips['facts']) if case_flips['facts'] else 0,
+            'applicant_flipped': np.mean(case_flips['applicant']) if case_flips['applicant'] else 0,
+            'defence_flipped': np.mean(case_flips['defence']) if case_flips['defence'] else 0,
+        })
+    
+    ablation_cache.clear()
     
     ablation_df = pd.DataFrame(ablation_results)
     ablation_df.to_csv(OUTPUT_DIR / "ablation_results.csv", index=False)
